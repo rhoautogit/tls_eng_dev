@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# Pipeline output
+output/
+reports/
+Test Outputs/
+
+# IDE / OS
+.claude/
+.pytest_cache/
+*.swp
+~$*
+
+# Diagrams
+*.drawio
+
+# Reference / comparison files
+PDF-Ingestion-main/
+*.png
+PATH_REFERENCES.md
+
+# Documents (push selectively)
+*.docx
+*.txt
+
+# Source code (push selectively for now)
+src/
+config/
+tests/
+*.py
+requirements.txt
