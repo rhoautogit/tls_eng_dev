@@ -11,8 +11,14 @@ reports/
 Test Outputs/
 
 # Large/vendor folders (do not commit)
-PaddleOCR/
 EasyOCR/
+
+# PaddleOCR: commit code, ignore environments/artifacts
+PaddleOCR/.venv/
+PaddleOCR/output/
+PaddleOCR/reports/
+PaddleOCR/__pycache__/
+PaddleOCR/.pytest_cache/
 
 # IDE / OS
 .claude/
