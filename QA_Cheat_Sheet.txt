@@ -1,0 +1,365 @@
+================================================================================
+    TLS PDF PIPELINE — Q&A CHEAT SHEET
+    Quick Reference for Project Expertise
+================================================================================
+
+
+PART 1: KEY TERMS & DEFINITIONS
+================================================================================
+
+PDF (Portable Document Format)
+    A file format that preserves document layout across devices. Contains
+    text, images, and vector graphics as structured objects.
+
+pdfplumber
+    A Python library that reads the raw geometry inside a PDF — the actual
+    characters, lines, and rectangles — to extract text and detect tables.
+    Works best on digitally created PDFs (not scanned).
+
+OpenCV (Open Source Computer Vision Library)
+    A computer vision library. We use it to convert PDF pages to images
+    and detect table structures visually using line detection and contour
+    analysis. Essential for scanned documents.
+
+PyMuPDF (also called "fitz")
+    A fast PDF library. We use it for three things: (1) extracting the
+    baseline text for coverage scoring, (2) capturing the full visual
+    state of each page (Rich Extractor), and (3) rendering pages to images.
+
+Rich Extractor
+    Our third extraction tool built on PyMuPDF. Captures every text span,
+    vector drawing, and embedded image with full styling details. Its
+    output (JSON) is what we use to reconstruct PDFs.
+
+CTM (Current Transformation Matrix)
+    A mathematical matrix in PDFs that scales, rotates, or translates
+    content. Engineering PDFs use CTMs inside Form XObjects to scale
+    drawings. We detect these to correct line widths during reconstruction.
+
+Form XObject
+    A reusable content block inside a PDF. Think of it as a "template"
+    that can be placed on a page. Engineering drawings are often wrapped
+    in Form XObjects with scaling CTMs (e.g., 0.1x).
+
+IoU (Intersection over Union)
+    A measure of overlap between two rectangles. Calculated as the area
+    of overlap divided by the area of their union. We use it to detect
+    duplicate table/text detections from different tools. Higher IoU =
+    more overlap = likely the same element.
+
+OCR (Optical Character Recognition)
+    Technology that reads text from images. We use Tesseract OCR to
+    extract text that's baked into raster images (not selectable text).
+
+Tesseract
+    Google's open-source OCR engine. Runs locally, reads text from images.
+    We use it to extract text from product photos, diagrams, and any
+    images that contain visible text.
+
+BLIP-2 (Bootstrapping Language-Image Pre-training)
+    An AI model by Salesforce that generates natural language descriptions
+    of images. Example: "an LED area light with adjustable panels on a
+    pole mount." We use the base model (~500MB), runs locally.
+
+CLIP (Contrastive Language-Image Pre-training)
+    An AI model by OpenAI that creates numerical "fingerprints" (vectors)
+    for images and text. These vectors can be compared to find images
+    that match a text description. This is how engineers will search for
+    specific drawings by describing them.
+
+Embedding
+    A list of numbers (vector) that represents the meaning of a piece of
+    content. Two similar images will have similar embeddings. We use CLIP
+    to create 512-dimensional embeddings for each extracted image.
+
+RAG (Retrieval-Augmented Generation)
+    A system that retrieves relevant documents/chunks and feeds them to
+    an AI model to generate answers. Phase 2 will build this using our
+    extracted data. Phase 1 prepares the data.
+
+CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    An image preprocessing technique that enhances local contrast without
+    over-amplifying noise. We use it in OpenCV retry passes to make faint
+    table lines visible.
+
+MPS (Metal Performance Shaders)
+    Apple's GPU acceleration framework for Mac. PyTorch uses MPS on
+    Apple Silicon (M1/M2/M3) chips for AI model inference. Slower than
+    NVIDIA CUDA but functional.
+
+CUDA (Compute Unified Device Architecture)
+    NVIDIA's GPU computing platform. Required for GPU-accelerated AI
+    model inference on Windows/Linux. Needs NVIDIA drivers + CUDA toolkit.
+
+Lattice Mode (pdfplumber)
+    Table detection mode that looks for explicit drawn lines/borders.
+    Best for tables with visible gridlines.
+
+Stream Mode (pdfplumber)
+    Table detection mode that infers table structure from text alignment.
+    Best for tables without visible borders (borderless tables).
+
+Visual Twin
+    Our technique of rendering the extraction result as a color-coded
+    overlay (green=text, blue=tables, yellow=images) and comparing it
+    against the original page to find gaps.
+
+Gap Map
+    A PNG image showing what the pipeline missed on a page. Green =
+    successfully extracted, Red = missed content. Generated during the
+    retry loop and included in the HTML report.
+
+Base14 Fonts
+    The 14 standard fonts built into every PDF viewer (Helvetica, Times,
+    Courier, Symbol, ZapfDingbats + bold/italic variants). We map all
+    fonts to these during reconstruction so no external font files needed.
+
+
+PART 2: TOUGH QUESTIONS & ANSWERS
+================================================================================
+
+
+Q: Why 95% threshold and not 100%?
+A: Engineering PDFs contain decorative content — watermarks, background
+   graphics, ornamental lines — that don't represent meaningful information.
+   95% allows for this while catching any real missed content. Also, headers
+   and footers are excluded from the baseline (top/bottom 8% of each page)
+   so the 95% is measured against meaningful content only.
+
+
+Q: Why 8% for header/footer exclusion? Why not 5% or 10%?
+A: 8% is calibrated to typical engineering document layouts. Most headers
+   are within the top 8% and footers within the bottom 8%. These contain
+   repeated titles, logos, page numbers, and dates — not unique content.
+   It's configurable in pipeline_config.yaml if needed for different formats.
+
+
+Q: Why 0.7/0.3 weights for the merger? Why not 50/50?
+A: Digital PDFs have precise geometry that pdfplumber reads perfectly, so
+   it gets 70% weight. OpenCV adds value as a backup but sometimes detects
+   false tables from visual noise. For scanned pages, it flips — OpenCV
+   gets 70% because it's designed for image-based detection while pdfplumber
+   has almost nothing to work with on a scanned page. The decision is
+   automatic: if pdfplumber extracts 100+ characters, the page is digital.
+
+
+Q: What were the actual results on the test PDF?
+A: Test PDF (19 pages): ALL pages passed with 100% final score. No retries
+   were needed. Average tool contributions across all pages:
+     - pdfplumber: 62.7%
+     - OpenCV: 29.9%
+     - Rich Extractor: 7.4%
+   Pages 2, 4, 5, 6, 15 had lower initial Layer 1 scores (52-90%) but the
+   Rich Extractor brought them all to 100% combined. All 19 pages were
+   digital (not scanned).
+
+
+Q: What happens with scanned PDFs?
+A: The pipeline auto-detects scanned pages (fewer than 20 selectable
+   characters). For scanned pages, OpenCV gets higher weight (70%) because
+   it converts the page to an image and detects tables visually. pdfplumber
+   still runs but contributes less. If the score is still below 95%, retries
+   apply CLAHE contrast enhancement and sharpening to make faint lines
+   visible. Very low-quality scans may remain unresolved and get flagged
+   for manual review.
+
+
+Q: What happens with encrypted or password-protected PDFs?
+A: PyMuPDF and pdfplumber can open PDFs with empty passwords (common for
+   print-restricted PDFs). For fully encrypted PDFs requiring a password,
+   the pipeline would fail to open the file and log an error. The user
+   would need to provide the password or decrypt the file first.
+
+
+Q: What about rotated pages?
+A: PyMuPDF handles page rotation automatically — it normalizes the
+   coordinate system regardless of the /Rotate flag in the PDF. pdfplumber
+   also handles rotation. The extraction and reconstruction work correctly
+   on rotated pages.
+
+
+Q: How does the retry loop actually improve results?
+A: Each retry targets the specific gap that was found:
+   - Retry 1: Switches pdfplumber mode (lattice <-> stream) and loosens
+     detection tolerances by 1.5x. Focuses only on the gap region.
+   - Retry 2: Adds OpenCV preprocessing — CLAHE (contrast enhancement,
+     clip=2.0, grid=8x8), sharpening, and noise reduction. Enables
+     text-alignment table detection in pdfplumber.
+   - Retry 3: Full page with everything combined. DPI bumped from 200 to
+     300, CLAHE clip raised to 3.0, all tolerances maximized (snap=10,
+     join=10, edge_min=1), both modes considered.
+   Early stop: if improvement < 1% for 2 consecutive retries, it stops.
+
+
+Q: How does the CTM correction work? Why were lines too thick?
+A: Many engineering PDFs store drawings in Form XObjects with a scaling
+   CTM like "0.1 0 0 0.1 0 0" (scale by 10%). PyMuPDF's get_drawings()
+   transforms coordinates to page space but does NOT scale the line widths.
+   So a width of 2.62 pts (in XObject space) should actually be 0.262 pts
+   on the page. Without correction, lines appear 10x too thick.
+
+   Our fix: during extraction, we detect the CTM scale factor from Form
+   XObjects and store it in the JSON. During reconstruction, we multiply
+   all stroke widths by this factor. It's automatic and works for any
+   scaling factor — not just 0.1.
+
+
+Q: How do you prove the reconstruction uses only extracted data?
+A: The reconstruct_pdf.py script reads ONLY from output/Test/rich/*.json
+   files. It opens a blank fitz.open() document, creates empty pages, and
+   populates them from JSON data. The original PDF path never appears in
+   the reconstruction code. You can verify by deleting the original PDF
+   and running reconstruction — it still works.
+
+
+Q: Why three tools? Isn't that redundant?
+A: Each tool has different strengths:
+   - pdfplumber: Best for digital text and structured tables (lattice)
+   - OpenCV: Best for scanned pages and visually complex layouts
+   - Rich Extractor: Captures everything else (fonts, drawings, images)
+
+   On our test PDF, some pages got 0% from pdfplumber but 86% from OpenCV
+   (page 5), and some pages were the reverse. The three-tool approach
+   ensures no content type is missed. The combined score is always higher
+   than any single tool.
+
+
+Q: Why not use an LLM for quality checking?
+A: Five reasons:
+   1. Our scoring is deterministic — same input = same result. An LLM is
+      non-deterministic and could give different answers each time.
+   2. The visual twin gap analysis already catches what's missed visually.
+   3. An LLM adds 2-4 GB memory and latency per page. At 500 PDFs/quarter
+      that's significant overhead.
+   4. We don't know TLS's hardware — LLMs need GPUs they may not have.
+   5. LLMs add value in Phase 2 (RAG query/answer), not Phase 1 (extraction).
+
+
+Q: What about multi-language PDFs?
+A: pdfplumber and PyMuPDF handle any language since they read raw PDF
+   objects (Unicode text). OpenCV is language-agnostic (visual detection).
+   Tesseract OCR supports 100+ languages but defaults to English. For
+   non-English image text, the Tesseract language pack would need to be
+   installed and the config updated.
+
+
+Q: How long does processing take?
+A: Depends on PDF complexity. The 19-page test PDF with engineering
+   drawings processes in under a minute on a modern machine (no retries
+   needed). Pages requiring retries add 5-15 seconds each. Image
+   intelligence (BLIP-2, CLIP) adds ~2-5 seconds per image with GPU,
+   or 10-30 seconds per image on CPU.
+
+
+Q: What if a new PDF type performs poorly?
+A: Several options, all in pipeline_config.yaml:
+   1. Adjust the accuracy_threshold (lower it if the content type has
+      unavoidable gaps like heavy watermarks)
+   2. Change default pdfplumber mode (stream works better for borderless)
+   3. Adjust OpenCV DPI (higher DPI for fine-detail documents)
+   4. Tune header/footer exclusion percentages
+   5. Adjust merger weights if one tool consistently performs better
+   No code changes needed — all tuning is in the YAML config file.
+
+
+Q: How does the HTML report show three-tool contributions?
+A: Each page in the HTML report has a stacked color bar showing the
+   percentage from each tool: green for pdfplumber, blue for OpenCV,
+   orange for Rich Extractor. The bars always sum to the total score.
+   There's also a document-level summary with average contributions
+   across all pages.
+
+
+Q: What's the difference between "initial_score" and "final_score"?
+A: initial_score is the Layer 1 only score (pdfplumber + OpenCV merged).
+   final_score is the combined score with all three tools including the
+   Rich Extractor's additional coverage. If no retries were needed, the
+   final_score is the three-tool combined score. If retries happened,
+   the final_score reflects the best combined score after retries.
+
+
+Q: How does multi-page table stitching work?
+A: The Custom Table Logic compares the last table on page N with the
+   first table on page N+1. If they have the same number of columns
+   with similar widths and compatible headers, they're linked with
+   continued_from_page and continued_on_page markers. The data stays
+   in separate CSV files but the metadata records the relationship.
+
+
+Q: What happens if Tesseract/BLIP/CLIP aren't installed?
+A: The pipeline runs fine without them. Each model uses graceful fallback:
+   - Tesseract not found: ocr_text field is empty, warning logged
+   - BLIP fails to load: caption field is empty, warning logged
+   - CLIP fails to load: embedding field is null, warning logged
+   All core extraction, scoring, retries, reporting, and reconstruction
+   work perfectly without these models. They only affect image searchability.
+
+
+Q: Can this handle CAD drawings or blueprint PDFs?
+A: Yes, if they're PDF format (not .dwg/.dxf). The Rich Extractor captures
+   all vector paths (lines, curves, shapes) which is how CAD drawings are
+   stored in PDFs. The CTM correction ensures thin lines render correctly.
+   Text labels and dimensions are extracted as text spans. Complex hatching
+   patterns will be captured as individual drawing paths.
+
+
+Q: What data leaves the machine?
+A: Nothing. Zero external API calls. All models (Tesseract, BLIP-2, CLIP)
+   run locally. All processing is on-machine. Models are downloaded once
+   during initial pip install, then run offline forever. This was a core
+   requirement from TLS for data compliance.
+
+
+Q: What's planned for Phase 2?
+A: Phase 2 builds the RAG pipeline on top of Phase 1's extracted data:
+   - Semantic chunking (context-aware, not fixed-length)
+   - Vector database (PostgreSQL + pgvector for embeddings)
+   - Hybrid retrieval (CLIP/embedding search + BM25 keyword matching)
+   - Query interface (natural language search for engineers)
+   - Small local LLM (Qwen/TinyLlama) for answer generation
+   - Design compliance checking (compare extracted data vs TLS specs)
+
+
+PART 3: QUICK-REFERENCE NUMBERS
+================================================================================
+
+  Accuracy threshold:              95%
+  Max retries:                     3
+  Header exclusion:                Top 8% of page
+  Footer exclusion:                Bottom 8% of page
+  Min text length for baseline:    3 characters
+  Digital page threshold:          100+ chars from pdfplumber
+  Scanned page threshold:          < 20 selectable chars
+  Digital weights:                 pdfplumber 0.7 / OpenCV 0.3
+  Scanned weights:                 pdfplumber 0.3 / OpenCV 0.7
+  Table IoU dedup threshold:       0.4
+  Text IoU dedup threshold:        0.5
+  Default OpenCV DPI:              200 (300 on retry 3)
+  Gap severity: low:               < 2% of page area
+  Gap severity: medium:            2-5% of page area
+  Gap severity: high:              > 5% of page area
+  Early stop:                      delta < 1% for 2 consecutive retries
+  Confidence: high:                score >= 80%
+  Confidence: medium:              score >= 50%
+  Confidence: low:                 score < 50%
+  BLIP-2 model:                    Salesforce/blip-image-captioning-base
+  CLIP model:                      ViT-B-32 (laion2b_s34b_b79k)
+  CLIP embedding dimension:        512
+  Tesseract path (Windows):        C:\Program Files\Tesseract-OCR\tesseract.exe
+  Retry 1 tolerance multiplier:    1.5x
+  Retry 3 snap tolerance:          10.0 (vs base 3.0)
+  Retry 3 DPI:                     300 (vs base 200)
+  Retry 3 CLAHE clip:              3.0 (vs base 2.0)
+
+  Test PDF results (19 pages):
+    Overall score:                 100%
+    Pages passed:                  19/19
+    Retries needed:                0
+    Avg pdfplumber contribution:   62.7%
+    Avg OpenCV contribution:       29.9%
+    Avg Rich Extractor:            7.4%
+
+
+================================================================================
+    END OF CHEAT SHEET
+================================================================================

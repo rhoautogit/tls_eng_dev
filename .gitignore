@@ -10,6 +10,10 @@ output/
 reports/
 Test Outputs/
 
+# Large/vendor folders (do not commit)
+PaddleOCR/
+EasyOCR/
+
 # IDE / OS
 .claude/
 .pytest_cache/
@@ -23,14 +27,3 @@ Test Outputs/
 PDF-Ingestion-main/
 *.png
 PATH_REFERENCES.md
-
-# Documents (push selectively)
-*.docx
-*.txt
-
-# Source code (push selectively for now)
-src/
-config/
-tests/
-*.py
-requirements.txt

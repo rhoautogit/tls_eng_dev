@@ -1,0 +1,372 @@
+================================================================================
+    TLS PDF PIPELINE — PC REQUIREMENTS
+    Minimum and Preferred Specifications
+================================================================================
+
+
+IMPORTANT NOTES
+================================================================================
+
+The pipeline has two modes of operation:
+
+  BASIC MODE: Text, table, and drawing extraction + PDF reconstruction
+  - Uses: pdfplumber, OpenCV, PyMuPDF, pandas, numpy
+  - Does NOT require a GPU
+  - Moderate RAM and CPU requirements
+
+  FULL MODE (with Image Intelligence): Adds OCR, image captioning, and
+  semantic embeddings for the RAG search pipeline
+  - Uses: Tesseract, PyTorch, BLIP-2, CLIP
+  - STRONGLY benefits from a dedicated GPU
+  - Requires significantly more RAM and disk space
+
+The requirements below cover FULL MODE. If running Basic Mode only, the
+minimum specs will be more than sufficient.
+
+
+================================================================================
+HOW THE TWO MODES WORK
+================================================================================
+
+BASIC MODE — What runs:
+  - pdfplumber          (text + table extraction from PDF geometry)
+  - OpenCV              (image-based table detection via computer vision)
+  - PyMuPDF             (baseline scoring, rich visual extraction, reconstruction)
+  - Custom Table Logic  (implicit tables, merged cells, multi-page stitching)
+  - Coverage Scoring    (3-tool scoring with per-tool contribution breakdown)
+  - Retry Loop          (visual twin gap analysis, up to 3 retries)
+  - Reporting           (JSON + HTML + CSV reports)
+  - PDF Reconstruction  (rebuild PDF from extracted data)
+
+  This covers all core extraction, scoring, retry, reporting, and
+  reconstruction features. No GPU is needed. No AI models are loaded.
+
+FULL MODE — What runs (everything in Basic Mode, PLUS):
+  - Tesseract OCR       (reads text baked into raster images)
+  - BLIP-2 Captioning   (generates natural language descriptions of images)
+  - CLIP Embeddings     (creates vector fingerprints for semantic image search)
+
+  These three models make images searchable in the downstream RAG pipeline.
+  They benefit significantly from GPU acceleration but will run on CPU if
+  no GPU is available (5-10x slower).
+
+
+AUTOMATIC BEHAVIOR — HOW THE SYSTEM DECIDES
+================================================================================
+
+The pipeline does NOT have a manual "mode switch." It always attempts to run
+Full Mode. The Image Intelligence module uses graceful fallback:
+
+  1. GPU Detection (automatic):
+     - On Windows/Linux: checks for NVIDIA CUDA GPU
+     - On Mac (Apple Silicon): checks for MPS (Metal) support
+     - If neither is found: falls back to CPU automatically
+     - No user action needed — this is fully automatic
+
+  2. Model Loading (automatic, with graceful failure):
+     - Tesseract: The pipeline checks if Tesseract is installed at the
+       expected path. If not found, OCR is silently skipped and the
+       image's ocr_text field will be empty.
+     - BLIP-2: The pipeline attempts to load the model on first use. If
+       PyTorch or transformers is not installed, or if the model fails
+       to load (e.g., not enough RAM), captioning is silently skipped.
+     - CLIP: Same behavior — attempts to load, silently skips on failure.
+
+  3. What this means in practice:
+     - If you install ALL dependencies (pip install -r requirements.txt),
+       the system runs in Full Mode automatically.
+     - If you skip the AI packages (torch, transformers, open_clip_torch),
+       the system effectively runs in Basic Mode — all extraction,
+       scoring, retry, reporting, and reconstruction works perfectly.
+       Only image OCR, captions, and embeddings will be empty.
+
+
+STEPS TO RUN IN BASIC MODE ONLY (skip AI models)
+================================================================================
+
+If your machine does not have a GPU, or you want faster processing without
+image intelligence, you can install only the Basic Mode dependencies:
+
+  STEP 1: Create a virtual environment
+      python -m venv venv
+
+  STEP 2: Activate the virtual environment
+      Windows:   venv\Scripts\activate
+      Mac/Linux: source venv/bin/activate
+
+  STEP 3: Install Basic Mode dependencies only
+      pip install pdfplumber>=0.10.0
+      pip install opencv-python>=4.8.0
+      pip install PyMuPDF>=1.23.0
+      pip install Pillow>=10.0.0
+      pip install numpy>=1.24.0
+      pip install pandas>=2.0.0
+      pip install PyYAML>=6.0
+
+  STEP 4: Run the pipeline
+      python run_pipeline.py path/to/file.pdf
+
+  The pipeline will log warnings like "BLIP model failed to load" or
+  "Tesseract not available" — these are expected and harmless. All core
+  extraction and reporting will work normally.
+
+
+STEPS TO RUN IN FULL MODE (with AI models)
+================================================================================
+
+  STEP 1: Create a virtual environment
+      python -m venv venv
+
+  STEP 2: Activate the virtual environment
+      Windows:   venv\Scripts\activate
+      Mac/Linux: source venv/bin/activate
+
+  STEP 3: Install ALL dependencies
+      pip install -r requirements.txt
+
+      This installs PyTorch, transformers, open_clip_torch, and all other
+      packages. PyTorch will be ~2 GB to download.
+
+  STEP 4: Install Tesseract OCR (system-level, not a Python package)
+      Windows:
+        - Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
+        - Install to: C:\Program Files\Tesseract-OCR\
+        - Ensure tesseract.exe is at that path
+
+      Mac:
+        - Run: brew install tesseract
+
+      Linux:
+        - Run: sudo apt install tesseract-ocr
+
+  STEP 5: (Windows only) Install NVIDIA GPU drivers + CUDA
+      - Download latest NVIDIA drivers from nvidia.com
+      - Install CUDA Toolkit 11.8+ from developer.nvidia.com/cuda-downloads
+      - Verify with: python -c "import torch; print(torch.cuda.is_available())"
+      - If this prints "True", GPU acceleration is active
+
+      Note: On Mac with Apple Silicon, GPU (MPS) works automatically with
+      no additional drivers. On Intel Macs, GPU is not available.
+
+  STEP 6: (Optional) Pre-download AI models
+      The BLIP-2 and CLIP models are downloaded from Hugging Face on first
+      use (~1.5 GB total). To download them before processing:
+
+      python -c "
+      from transformers import BlipProcessor, BlipForConditionalGeneration
+      BlipProcessor.from_pretrained('Salesforce/blip-image-captioning-base')
+      BlipForConditionalGeneration.from_pretrained('Salesforce/blip-image-captioning-base')
+      import open_clip
+      open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+      print('All models downloaded successfully.')
+      "
+
+  STEP 7: Run the pipeline
+      python run_pipeline.py path/to/file.pdf
+
+  The pipeline will log: "Image intelligence using device: cuda" (or "mps"
+  or "cpu") and "BLIP model loaded" and "CLIP model loaded". All image
+  intelligence features are now active.
+
+
+TROUBLESHOOTING: IF FULL MODE IS NOT WORKING
+================================================================================
+
+  PROBLEM: "Tesseract not available" warning
+  FIX:     Install Tesseract OCR (see Step 4 above). On Windows, make sure
+           it is installed to C:\Program Files\Tesseract-OCR\ exactly.
+
+  PROBLEM: "BLIP model failed to load" warning
+  FIX:     Check that PyTorch and transformers are installed:
+             pip install torch torchvision transformers
+           If you get an out-of-memory error, your machine may not have
+           enough RAM (16 GB minimum for Full Mode).
+
+  PROBLEM: "CLIP model failed to load" warning
+  FIX:     Check that open_clip_torch is installed:
+             pip install open_clip_torch
+           Same RAM considerations as BLIP.
+
+  PROBLEM: GPU not detected (prints "cpu" instead of "cuda")
+  FIX (Windows):
+           1. Verify NVIDIA drivers: nvidia-smi (should show your GPU)
+           2. Verify CUDA: nvcc --version (should show 11.8+)
+           3. Reinstall PyTorch with CUDA:
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+           4. Verify: python -c "import torch; print(torch.cuda.is_available())"
+
+  FIX (Mac):
+           Apple Silicon (M1/M2/M3) uses MPS automatically. No fix needed.
+           Intel Macs cannot use GPU acceleration — CPU fallback is normal.
+
+  PROBLEM: Models run but are very slow
+  FIX:     This is normal on CPU. GPU acceleration provides 5-10x speedup.
+           If you don't need image search features, run Basic Mode instead
+           (see steps above) to skip the AI models entirely.
+
+
+================================================================================
+WINDOWS REQUIREMENTS
+================================================================================
+
+                          MINIMUM                   PREFERRED
+--------------------------------------------------------------------------------
+
+Operating System          Windows 10 (64-bit)       Windows 11 (64-bit)
+
+Processor (CPU)           Intel Core i5 (8th Gen)   Intel Core i7/i9 (12th Gen+)
+                          or AMD Ryzen 5 3600       or AMD Ryzen 7 5800X+
+                          (4 cores / 8 threads)     (8+ cores / 16+ threads)
+
+RAM                       16 GB                     32 GB or more
+
+GPU (for Full Mode)       Not required for          NVIDIA GPU with 8+ GB VRAM
+                          Basic Mode                (e.g., RTX 3070, RTX 4060 Ti,
+                          For Full Mode:            or better)
+                          NVIDIA GPU with 4+ GB     CUDA 11.8+ compatible
+                          VRAM (e.g., GTX 1650,
+                          RTX 3050)
+
+Storage                   20 GB free space          50+ GB free SSD space
+                          (SSD recommended)         (NVMe preferred)
+
+                          Breakdown:                Breakdown:
+                          - Python + packages: 5 GB - Python + packages: 5 GB
+                          - PyTorch + models: 8 GB  - PyTorch + models: 8 GB
+                          - Working space: 7 GB     - Working space: 37+ GB
+                                                    (for large PDF batches)
+
+Python                    Python 3.10+              Python 3.11 or 3.12
+                                                    (best performance)
+
+Additional Software       Tesseract OCR             Tesseract OCR
+                          (installed to             (installed to
+                          C:\Program Files\         C:\Program Files\
+                          Tesseract-OCR\)           Tesseract-OCR\)
+
+                          Git (for version control) Git (for version control)
+
+Network                   Not required              Not required
+                          (all processing local)    (all processing local)
+                          Internet needed only      Internet needed only
+                          for initial setup         for initial setup
+                          (pip install)             (pip install)
+
+Display                   1920 x 1080               2560 x 1440 or higher
+                          (for viewing HTML         (for comfortable report
+                          reports and gap maps)     review and gap map analysis)
+
+
+================================================================================
+MAC REQUIREMENTS
+================================================================================
+
+                          MINIMUM                   PREFERRED
+--------------------------------------------------------------------------------
+
+Operating System          macOS 12 Monterey         macOS 14 Sonoma or newer
+
+Processor (CPU)           Apple M1                  Apple M2 Pro / M3 Pro
+                          or Intel Core i5          or M2 Max / M3 Max
+                          (8th Gen+)                (8+ performance cores)
+
+RAM                       16 GB                     32 GB or more
+                          (unified memory on        (unified memory on
+                          Apple Silicon)            Apple Silicon)
+
+GPU (for Full Mode)       Apple M1 integrated       Apple M2 Pro+ integrated
+                          GPU (8-core)              GPU (16+ cores)
+                          or Intel Mac with         — Apple Silicon uses MPS
+                          discrete AMD GPU          (Metal Performance Shaders)
+                                                    for PyTorch acceleration
+
+                          Note: On Apple Silicon,   Note: NVIDIA GPUs (CUDA) are
+                          PyTorch uses MPS          not available on Mac. MPS
+                          (Metal) backend.          provides good acceleration
+                          Slower than CUDA but      on M2 Pro and above.
+                          functional.
+
+Storage                   20 GB free space          50+ GB free SSD space
+                          (all Macs have SSD)
+
+                          Breakdown:                Breakdown:
+                          - Python + packages: 5 GB - Python + packages: 5 GB
+                          - PyTorch + models: 8 GB  - PyTorch + models: 8 GB
+                          - Working space: 7 GB     - Working space: 37+ GB
+
+Python                    Python 3.10+              Python 3.11 or 3.12
+                          (via Homebrew or          (via Homebrew)
+                          python.org installer)
+
+Additional Software       Tesseract OCR             Tesseract OCR
+                          (brew install tesseract)  (brew install tesseract)
+
+                          Homebrew package manager  Homebrew package manager
+                          (for Tesseract install)   (for Tesseract install)
+
+                          Git (pre-installed on     Git (pre-installed on
+                          macOS with Xcode CLI)     macOS with Xcode CLI)
+
+Network                   Not required              Not required
+                          (all processing local)    (all processing local)
+
+Display                   Built-in Retina display   Built-in Retina display
+                          (any modern Mac)          or external 4K monitor
+
+
+================================================================================
+NOTES ON GPU USAGE
+================================================================================
+
+The GPU is used ONLY for the Image Intelligence features:
+
+  1. BLIP-2 (image captioning model)   — ~3 GB VRAM
+  2. CLIP (image embedding model)      — ~1.5 GB VRAM
+  3. PyTorch operations                — ~0.5 GB VRAM overhead
+
+  Total GPU memory needed:             ~5 GB minimum
+
+If no compatible GPU is available, these models automatically fall back to
+CPU processing. This is significantly slower (5-10x) but fully functional.
+
+  - Windows: NVIDIA GPUs with CUDA support are required for GPU acceleration
+  - Mac (Apple Silicon): Uses MPS (Metal Performance Shaders) — built into
+    the M1/M2/M3 chips, no additional drivers needed
+  - Mac (Intel): No GPU acceleration available; CPU fallback only
+
+The core extraction (pdfplumber, OpenCV, PyMuPDF) and PDF reconstruction
+do NOT use the GPU at all — they run on CPU only.
+
+
+================================================================================
+STORAGE ESTIMATES PER PDF
+================================================================================
+
+Each processed PDF generates approximately:
+
+  Text output:        10-50 KB per page (Markdown + metadata JSON)
+  Table output:       5-30 KB per table (CSV + metadata JSON)
+  Image output:       50 KB - 2 MB per image (PNG/JPG + metadata)
+  Rich JSON:          200 KB - 5 MB per page (includes base64 image data)
+  Gap maps:           100-300 KB per retry (PNG images)
+  Reports:            50-500 KB per PDF (JSON + HTML + CSV)
+  Reconstructed PDF:  500 KB - 10 MB per document
+
+  ESTIMATE PER PDF:   ~5-30 MB (varies with page count and image density)
+  PER QUARTER:        ~2.5-15 GB for 500 PDFs
+
+
+================================================================================
+QUICK SETUP CHECKLIST
+================================================================================
+
+  [ ] Python 3.10+ installed
+  [ ] Tesseract OCR installed (see platform-specific path above)
+  [ ] Git installed
+  [ ] Virtual environment created:  python -m venv venv
+  [ ] Dependencies installed:       pip install -r requirements.txt
+  [ ] (Optional) NVIDIA drivers + CUDA toolkit (Windows, for GPU mode)
+  [ ] Verify setup:                 python setup_check.py
+
+
+================================================================================
