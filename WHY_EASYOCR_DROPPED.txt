@@ -1,0 +1,87 @@
+WHY EASYOCR WAS NOT SELECTED FOR THE TLS ENGINEERING PDF PIPELINE
+===================================================================
+Date: 2026-03-25
+Test Document: Test2.pdf (151 pages, mixed engineering drawings and text)
+Comparison: EasyOCR (PyTorch/CUDA) vs PaddleOCR (PaddlePaddle-GPU)
+
+SUMMARY
+-------
+EasyOCR was evaluated as a potential OCR engine for the TLS Engineering PDF
+pipeline. After testing on the same 151-page engineering PDF used to benchmark
+PaddleOCR, EasyOCR was dropped due to significantly lower accuracy, slower
+processing speed, and poor handling of engineering document content.
+
+
+CONFIDENCE / ACCURACY
+---------------------
+- PaddleOCR: 95%+ confidence on 149 out of 151 pages. Only ~10 pages flagged
+  for Qwen-VL verification.
+- EasyOCR: 70-85% confidence on typical text pages, dropping to 30-50% on
+  engineering drawings and tables. 30+ pages flagged as failures.
+- EasyOCR's CRAFT text detector struggles with engineering-specific content
+  (line drawings, dimension annotations, technical tables with grid lines).
+- PaddleOCR's PP-OCRv4 model handles these document types far more reliably.
+
+
+RETRY BEHAVIOR
+--------------
+- The pipeline uses a retry loop with escalating preprocessing (higher DPI,
+  CLAHE contrast enhancement, adaptive binarization, morphological cleanup).
+- PaddleOCR: Retries improve confidence on borderline pages as expected.
+- EasyOCR: Retries either have no effect or DECREASE confidence. Higher DPI
+  and preprocessing that helps PaddleOCR actually confuses EasyOCR's CRAFT
+  detector, producing worse results on subsequent attempts.
+- This means every low-confidence page burns through all 3 retry attempts
+  with no improvement, wasting significant processing time.
+
+
+PROCESSING SPEED
+----------------
+- PaddleOCR: ~5 seconds per page (GPU accelerated).
+- EasyOCR: ~30-45 seconds per page. This includes:
+  - Slower base inference (~10-15s per page vs ~5s for PaddleOCR)
+  - Nearly every page triggering 3 retries due to low confidence (3x overhead)
+- On the full 151-page test document, EasyOCR took roughly 4-6x longer than
+  PaddleOCR to produce dramatically worse results.
+
+
+FAILURE COUNTS (Test2.pdf, 151 pages)
+--------------------------------------
+                    PaddleOCR       EasyOCR
+Pages processed:    151             151
+Pages passed:       141             ~120
+Pages flagged:      10              30+
+Avg confidence:     96%+            ~78%
+Retries triggered:  ~10             100+ (nearly every page)
+
+
+GPU MEMORY
+----------
+Both engines run on GPU (NVIDIA CUDA). EasyOCR uses PyTorch, PaddleOCR uses
+PaddlePaddle. Both required explicit GPU memory cleanup (empty_cache) between
+pages and before Qwen-VL verification. No significant difference in GPU memory
+behavior between the two engines.
+
+
+FRAMEWORK CONSIDERATIONS
+------------------------
+- EasyOCR runs on PyTorch, which is the same framework used by many other ML
+  tools. This was initially seen as an advantage (shared GPU memory pool with
+  Qwen-VL via Ollama/PyTorch).
+- PaddleOCR runs on PaddlePaddle, a separate framework. This requires
+  installing paddlepaddle-gpu alongside PyTorch (for Qwen-VL).
+- Despite the framework convenience of EasyOCR, the accuracy gap is too large
+  to justify using it for production engineering documents.
+
+
+CONCLUSION
+----------
+PaddleOCR (PP-OCRv4) is the clear winner for TLS Engineering PDF processing.
+The accuracy difference (95%+ vs 70-85%) is not a marginal gap that could be
+closed with tuning. It reflects a fundamental difference in model capability
+for engineering document content. EasyOCR's CRAFT detector and standard
+recognition network are not suited for the mix of technical drawings, tables,
+and annotations found in TLS engineering PDFs.
+
+The EasyOCR pipeline code is preserved in the EasyOCR/ folder for reference
+but will not be used in production.

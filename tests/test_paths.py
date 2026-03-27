@@ -195,7 +195,7 @@ class TestHybridPathMerge:
             ],
             tables=[],
             images=[],
-            source="tesseract_ocr",
+            source="paddleocr",
             page_width=612,
             page_height=792,
         )
@@ -250,7 +250,7 @@ class TestHybridPathMerge:
 
 class TestScannedPathPreprocessRetry:
     def test_preprocess_for_retry_applies_clahe(self):
-        from src.paths.scanned_path import _preprocess_for_retry
+        from src.paths.scanned_path import preprocess_for_retry
 
         gray = np.full((100, 100), 128, dtype=np.uint8)
         strategy = {
@@ -259,11 +259,11 @@ class TestScannedPathPreprocessRetry:
             "line_removal": False,
             "denoise": False,
         }
-        result = _preprocess_for_retry(gray, strategy)
+        result = preprocess_for_retry(gray, strategy)
         assert result.shape == gray.shape
 
     def test_preprocess_for_retry_adaptive_binarize(self):
-        from src.paths.scanned_path import _preprocess_for_retry
+        from src.paths.scanned_path import preprocess_for_retry
 
         gray = np.random.randint(0, 255, (200, 200), dtype=np.uint8)
         strategy = {
@@ -274,13 +274,13 @@ class TestScannedPathPreprocessRetry:
             "adaptive_block_size": 15,
             "adaptive_constant": 5,
         }
-        result = _preprocess_for_retry(gray, strategy)
+        result = preprocess_for_retry(gray, strategy)
         # Should be binary (0 or 255 only)
         unique = set(np.unique(result))
         assert unique.issubset({0, 255})
 
     def test_preprocess_for_retry_morphological_open(self):
-        from src.paths.scanned_path import _preprocess_for_retry
+        from src.paths.scanned_path import preprocess_for_retry
 
         gray = np.full((100, 100), 200, dtype=np.uint8)
         strategy = {
@@ -290,7 +290,7 @@ class TestScannedPathPreprocessRetry:
             "morphological_open": True,
             "morphological_kernel": [3, 3],
         }
-        result = _preprocess_for_retry(gray, strategy)
+        result = preprocess_for_retry(gray, strategy)
         assert result.shape == gray.shape
 
 
@@ -356,7 +356,7 @@ class TestScannedPathRetryLoop:
 
         initial_extraction = PageExtractionResult(
             page_num=0, text_blocks=[], tables=[], images=[],
-            source="tesseract_ocr", is_scanned=True,
+            source="paddleocr", is_scanned=True,
             page_width=612, page_height=792, page_type=PageType.SCANNED,
         )
         initial_gate = ConfidenceGate(
@@ -385,18 +385,29 @@ class TestScannedPathRetryLoop:
         ]
         gate_iter = iter(improving_gates)
 
+        # Mock PaddleOCR engine on the executor
+        from src.paddle_ocr_engine import OCRPageResult
+        mock_ocr_result = OCRPageResult(
+            lines=[], page_confidence=0.0, word_count=100,
+            high_confidence_words=95, flagged_words=5,
+        )
+
+        def mock_ocr_image(*a, **k):
+            return mock_ocr_result
+
+        executor._engine = MagicMock()
+        executor._engine.ocr_image = mock_ocr_image
+        executor._engine.detect_table_structure = MagicMock(return_value=[])
+
         with patch(
-            "src.paths.scanned_path._render_page_image",
+            "src.paths.scanned_path.render_page_image",
             return_value=(np.zeros((100, 100, 3), dtype=np.uint8), 612.0, 792.0),
         ), patch(
-            "src.paths.scanned_path._preprocess_for_retry",
+            "src.paths.scanned_path.preprocess_for_retry",
             return_value=np.zeros((100, 100), dtype=np.uint8),
         ), patch(
-            "src.paths.scanned_path._compute_page_confidence",
+            "src.paths.scanned_path.compute_confidence_gate",
             side_effect=lambda *a, **k: next(gate_iter),
-        ), patch(
-            "src.paths.scanned_path.extract_rich_page_ocr",
-            return_value={"text_blocks": []},
         ):
             best_ext, best_gate, best_score, records = executor._retry_loop(
                 "fake.pdf", 0, 612, 792,
@@ -419,7 +430,7 @@ class TestScannedPathRetryLoop:
 
         initial_extraction = PageExtractionResult(
             page_num=0, text_blocks=[], tables=[], images=[],
-            source="tesseract_ocr", is_scanned=True,
+            source="paddleocr", is_scanned=True,
             page_width=612, page_height=792, page_type=PageType.SCANNED,
         )
         initial_gate = ConfidenceGate(
@@ -448,14 +459,24 @@ class TestScannedPathRetryLoop:
         ]
         gate_iter = iter(plateau_gates)
 
+        # Mock PaddleOCR engine on the executor
+        from src.paddle_ocr_engine import OCRPageResult
+        mock_ocr_result = OCRPageResult(
+            lines=[], page_confidence=0.0, word_count=100,
+        )
+
+        executor._engine = MagicMock()
+        executor._engine.ocr_image = MagicMock(return_value=mock_ocr_result)
+        executor._engine.detect_table_structure = MagicMock(return_value=[])
+
         with patch(
-            "src.paths.scanned_path._render_page_image",
+            "src.paths.scanned_path.render_page_image",
             return_value=(np.zeros((100, 100, 3), dtype=np.uint8), 612.0, 792.0),
         ), patch(
-            "src.paths.scanned_path._preprocess_for_retry",
+            "src.paths.scanned_path.preprocess_for_retry",
             return_value=np.zeros((100, 100), dtype=np.uint8),
         ), patch(
-            "src.paths.scanned_path._compute_page_confidence",
+            "src.paths.scanned_path.compute_confidence_gate",
             side_effect=lambda *a, **k: next(gate_iter),
         ):
             best_ext, best_gate, best_score, records = executor._retry_loop(

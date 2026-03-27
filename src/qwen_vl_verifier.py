@@ -1,6 +1,6 @@
 """Qwen-VL visual model verifier for scanned page OCR output.
 
-Calls Qwen3-VL (8B) locally via Ollama to verify and correct OCR
+Calls Qwen2.5-VL (7B) locally via Ollama to verify and correct OCR
 extraction on pages flagged by the confidence gate. Runs entirely
 local -- no external API calls.
 
@@ -101,7 +101,8 @@ def _call_ollama(
     image_base64: str,
     host: str = "http://localhost:11434",
     num_ctx: int = -1,
-    timeout: int = 120,
+    timeout: int = 300,
+    keep_alive: str = "10m",
 ) -> str:
     """Call Ollama's generate API with an image and prompt.
 
@@ -110,12 +111,23 @@ def _call_ollama(
     import requests
 
     url = f"{host}/api/generate"
+    # Qwen3-VL: prepend /no_think to suppress chain-of-thought reasoning,
+    # which otherwise produces prose instead of JSON.
+    formatted_prompt = f"/no_think\n{prompt}"
+
     payload = {
         "model": model,
-        "prompt": prompt,
+        "system": (
+            "You are an OCR verification assistant. "
+            "Output ONLY a single JSON object. "
+            "No markdown fences, no explanation, no text before or after the JSON."
+        ),
+        "prompt": formatted_prompt,
         "images": [image_base64],
         "stream": False,
+        "format": "json",
         "options": {},
+        "keep_alive": keep_alive,
     }
 
     if num_ctx != -1:
@@ -139,48 +151,149 @@ def _call_ollama(
         raise
 
 
+def _unload_ollama_models(host: str = "http://localhost:11434") -> None:
+    """Unload all models from Ollama to free GPU VRAM.
+
+    Sends keep_alive=0 to each loaded model so Ollama releases VRAM.
+    Call this before PaddleOCR to give it full GPU, or after PaddleOCR
+    to prepare for reloading the verification model cleanly.
+    """
+    import requests
+
+    try:
+        resp = requests.get(f"{host}/api/ps", timeout=5)
+        if resp.status_code != 200:
+            return
+        running = resp.json().get("models", [])
+        for m in running:
+            model_name = m.get("name", "")
+            if model_name:
+                logger.info("Unloading Ollama model: %s", model_name)
+                requests.post(
+                    f"{host}/api/generate",
+                    json={"model": model_name, "keep_alive": 0},
+                    timeout=30,
+                )
+        if running:
+            logger.info("Unloaded %d Ollama model(s) to free VRAM", len(running))
+    except Exception as e:
+        logger.debug("Could not unload Ollama models: %s", e)
+
+
+def _release_paddle_gpu() -> None:
+    """Aggressively release PaddlePaddle GPU memory.
+
+    Goes beyond release_shared() by clearing the CUDA cache and forcing
+    garbage collection. This is needed on 8GB GPUs where PaddlePaddle's
+    CUDA context can hold 1-2GB even after the engine is released.
+    """
+    import gc
+
+    try:
+        from .paddle_ocr_engine import PaddleOCREngine
+        PaddleOCREngine.release_shared()
+    except Exception:
+        pass
+
+    gc.collect()
+
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda():
+            paddle.device.cuda.empty_cache()
+    except Exception:
+        pass
+
+    gc.collect()
+
+
+def _warmup_ollama(
+    model: str,
+    host: str = "http://localhost:11434",
+    timeout: int = 180,
+) -> bool:
+    """Pre-load the model into GPU memory by sending a minimal request.
+
+    Ollama loads models lazily on first request. After PaddleOCR releases
+    GPU memory, we call this so the model is fully loaded before the real
+    verification loop starts. This avoids the cold-start cost eating into
+    the per-page timeout.
+
+    Returns True if warmup succeeded.
+    """
+    import requests
+
+    # First, ensure no stale Ollama models are hogging VRAM
+    _unload_ollama_models(host)
+
+    # Aggressively free PaddlePaddle GPU memory
+    _release_paddle_gpu()
+
+    import time
+    time.sleep(2)  # brief pause to let VRAM settle
+
+    url = f"{host}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": "Hi",
+        "stream": False,
+        "keep_alive": "10m",
+    }
+
+    try:
+        logger.info("Warming up Qwen-VL model (%s), loading into GPU...", model)
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        logger.info("Qwen-VL model loaded and ready")
+        return True
+    except Exception as e:
+        logger.warning("Qwen-VL warmup failed: %s", e)
+        return False
+
+
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
-VERIFICATION_PROMPT = """You are verifying OCR-extracted text against the original scanned document image.
-
-Below is the text that was extracted from this page using OCR. Compare it carefully against what you see in the image.
+VERIFICATION_PROMPT = """Compare the OCR-extracted text below against the scanned document image.
 
 === EXTRACTED OCR TEXT ===
 {ocr_text}
 === END OCR TEXT ===
 
-Analyze the image and the extracted text. Respond in the following JSON format ONLY (no other text):
+Respond with ONLY this JSON (no other text before or after):
 
 {{
-  "is_accurate": true/false,
-  "confidence": 0.0 to 1.0,
+  "is_accurate": true,
+  "confidence": 0.95,
+  "corrections": [],
+  "missing_text": [],
+  "summary": "OCR text matches the image"
+}}
+
+If there are errors, set is_accurate to false and list corrections:
+
+{{
+  "is_accurate": false,
+  "confidence": 0.85,
   "corrections": [
     {{
-      "original": "incorrect text from OCR",
-      "corrected": "what it should be",
-      "location": "description of where on the page",
-      "confidence": 0.0 to 1.0
+      "original": "incorret word",
+      "corrected": "incorrect word",
+      "location": "top of page",
+      "confidence": 0.9
     }}
   ],
-  "missing_text": ["any text visible in the image but missing from OCR"],
-  "summary": "brief summary of verification findings"
+  "missing_text": ["any significant text visible in image but missing from OCR"],
+  "summary": "Found 1 misspelling"
 }}
 
 Rules:
 - Only flag real errors, not formatting differences
 - For numbers and technical values, be especially precise
-- If the OCR text is accurate, set is_accurate to true and leave corrections empty
 - Include missing_text only for significant content (not headers/footers/page numbers)
-- Be concise in the summary"""
+- Do not explain. Do not add any text outside the JSON."""
 
 
-TABLE_VERIFICATION_PROMPT = """You are verifying OCR-extracted table data against the original scanned document image.
-
-This page contains tables. Below is what was extracted. Compare against the image carefully, especially:
-- Cell values (numbers, text)
-- Row/column alignment
-- Missing rows or columns
-- Merged cell handling
+TABLE_VERIFICATION_PROMPT = """Compare the OCR-extracted table data below against the scanned document image.
 
 === EXTRACTED TABLE DATA ===
 {table_text}
@@ -190,62 +303,131 @@ This page contains tables. Below is what was extracted. Compare against the imag
 {ocr_text}
 === END TEXT ===
 
-Respond in JSON format ONLY:
+Check carefully: cell values, row/column alignment, missing rows or columns, merged cells.
+
+Respond with ONLY this JSON (no other text before or after):
 
 {{
-  "is_accurate": true/false,
-  "confidence": 0.0 to 1.0,
+  "is_accurate": true,
+  "confidence": 0.95,
+  "corrections": [],
+  "missing_text": [],
+  "summary": "Table data matches the image"
+}}
+
+If there are errors, set is_accurate to false and list corrections:
+
+{{
+  "is_accurate": false,
+  "confidence": 0.8,
   "corrections": [
     {{
       "original": "incorrect value",
       "corrected": "correct value",
-      "location": "table N, row R, column C",
-      "confidence": 0.0 to 1.0
+      "location": "table 1, row 2, column 3",
+      "confidence": 0.9
     }}
   ],
   "missing_text": ["any content visible but not extracted"],
-  "summary": "brief summary"
-}}"""
+  "summary": "Found 1 incorrect cell value"
+}}
+
+Do not explain. Do not add any text outside the JSON."""
 
 
 # ── Response parser ──────────────────────────────────────────────────────────
+
+def _fix_json_quirks(text: str) -> str:
+    """Fix common LLM JSON quirks before parsing."""
+    # Replace Python-style True/False/None with JSON equivalents
+    text = re.sub(r'\bTrue\b', 'true', text)
+    text = re.sub(r'\bFalse\b', 'false', text)
+    text = re.sub(r'\bNone\b', 'null', text)
+    # Remove trailing commas before } or ]
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    return text
+
+
+def _parse_prose_fallback(raw: str) -> VerificationResponse:
+    """Extract verification info from a prose (non-JSON) response.
+
+    When Qwen-VL ignores the JSON instruction and returns natural language,
+    we still try to extract useful signals: does it say the text is accurate,
+    and does it mention any specific corrections.
+    """
+    result = VerificationResponse(raw_response=raw)
+    lower = raw.lower()
+
+    # Detect accuracy signal from prose
+    accurate_signals = [
+        "accurately reflects", "correctly captures", "matches the image",
+        "text is accurate", "ocr text is accurate", "correctly extracted",
+        "no significant errors", "no errors", "fully match",
+    ]
+    inaccurate_signals = [
+        "does not fully match", "does not match", "discrepancies",
+        "incorrectly", "missing", "errors found", "not accurate",
+        "significant errors", "key issues",
+    ]
+
+    accurate_hits = sum(1 for s in accurate_signals if s in lower)
+    inaccurate_hits = sum(1 for s in inaccurate_signals if s in lower)
+
+    if accurate_hits > inaccurate_hits:
+        result.is_accurate = True
+        result.confidence = 0.85
+    elif inaccurate_hits > 0:
+        result.is_accurate = False
+        result.confidence = 0.6
+    else:
+        result.is_accurate = False
+        result.confidence = 0.5
+
+    result.summary = raw[:300]
+
+    logger.info(
+        "Prose fallback: is_accurate=%s (accurate_signals=%d, inaccurate_signals=%d)",
+        result.is_accurate, accurate_hits, inaccurate_hits,
+    )
+    return result
+
 
 def _parse_verification_response(raw: str) -> VerificationResponse:
     """Parse Qwen-VL's JSON response into a VerificationResponse.
 
     Handles common LLM quirks: markdown code blocks, trailing commas,
-    partial JSON, etc.
+    Python-style booleans, mixed text around JSON, etc.
     """
     result = VerificationResponse(raw_response=raw)
 
     # Strip markdown code blocks if present
     cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # Remove ```json or ``` wrapper
-        lines = cleaned.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines)
+    # Handle ```json ... ``` or ``` ... ``` wrappers
+    fence_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)```', cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
 
-    # Try to parse JSON
+    cleaned = _fix_json_quirks(cleaned)
+
+    # Try to parse JSON directly
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to extract JSON from mixed text
-        json_match = re.search(r'\{[\s\S]*\}', cleaned)
-        if json_match:
+        # Try to extract the outermost JSON object from mixed text
+        # Use a non-greedy approach: find first { and last }
+        first_brace = cleaned.find('{')
+        last_brace = cleaned.rfind('}')
+        if first_brace != -1 and last_brace > first_brace:
+            candidate = cleaned[first_brace:last_brace + 1]
+            candidate = _fix_json_quirks(candidate)
             try:
-                data = json.loads(json_match.group())
+                data = json.loads(candidate)
             except json.JSONDecodeError:
-                logger.warning("Could not parse Qwen-VL response as JSON")
-                result.summary = f"Unparseable response: {raw[:200]}"
-                return result
+                logger.warning("Could not parse Qwen-VL response as JSON, using prose fallback")
+                return _parse_prose_fallback(raw)
         else:
-            logger.warning("No JSON found in Qwen-VL response")
-            result.summary = f"No JSON in response: {raw[:200]}"
-            return result
+            logger.warning("No JSON found in Qwen-VL response, using prose fallback")
+            return _parse_prose_fallback(raw)
 
     result.is_accurate = bool(data.get("is_accurate", False))
     result.confidence = float(data.get("confidence", 0.0))
@@ -267,7 +449,7 @@ def _parse_verification_response(raw: str) -> VerificationResponse:
 # ── Verifier class ───────────────────────────────────────────────────────────
 
 class QwenVLVerifier:
-    """Verifies and corrects OCR output using Qwen3-VL via Ollama."""
+    """Verifies and corrects OCR output using Qwen2.5-VL via Ollama."""
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -278,21 +460,54 @@ class QwenVLVerifier:
         self.host = str(qwen_cfg.get("ollama_host", "http://localhost:11434"))
         self.gpu_num_ctx = int(qwen_cfg.get("gpu_num_ctx", -1))
         self.cpu_num_ctx = int(qwen_cfg.get("cpu_num_ctx", 0))
+        self.timeout = int(qwen_cfg.get("timeout", 300))
         self._render_dpi = 200
 
         # Detect GPU availability to choose num_ctx
         self._num_ctx = self._detect_num_ctx()
 
     def _detect_num_ctx(self) -> int:
-        """Choose num_ctx based on GPU availability."""
+        """Choose num_ctx based on whether Ollama is using GPU.
+
+        Queries the Ollama API to check if the model is loaded with GPU
+        layers, rather than importing torch (which we don't need in the
+        PaddleOCR pipeline).
+        """
         try:
-            import torch
-            if torch.cuda.is_available():
-                logger.info("GPU detected, using gpu_num_ctx=%d", self.gpu_num_ctx)
-                return self.gpu_num_ctx
-        except ImportError:
+            import requests
+            resp = requests.get(f"{self.host}/api/ps", timeout=5)
+            if resp.status_code == 200:
+                running = resp.json().get("models", [])
+                for m in running:
+                    # If any model is using GPU layers, assume GPU is available
+                    details = m.get("details", {})
+                    size_vram = m.get("size_vram", 0)
+                    if size_vram > 0:
+                        logger.info(
+                            "Ollama GPU detected (VRAM in use), "
+                            "using gpu_num_ctx=%d", self.gpu_num_ctx,
+                        )
+                        return self.gpu_num_ctx
+        except Exception:
             pass
-        logger.info("No GPU, using cpu_num_ctx=%d", self.cpu_num_ctx)
+
+        # Fallback: check if CUDA is available via a lightweight check
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info(
+                    "GPU detected via nvidia-smi, using gpu_num_ctx=%d",
+                    self.gpu_num_ctx,
+                )
+                return self.gpu_num_ctx
+        except Exception:
+            pass
+
+        logger.info("No GPU detected, using cpu_num_ctx=%d", self.cpu_num_ctx)
         return self.cpu_num_ctx
 
     def is_available(self) -> bool:
@@ -378,6 +593,7 @@ class QwenVLVerifier:
                 image_base64=image_b64,
                 host=self.host,
                 num_ctx=self._num_ctx,
+                timeout=self.timeout,
             )
             logger.info(
                 "Page %d: Qwen-VL response received (%d chars)",
@@ -447,6 +663,11 @@ class QwenVLVerifier:
             "Running Qwen-VL verification on %d flagged pages...",
             len(flagged_pages),
         )
+
+        # Warmup: pre-load model into GPU before the verification loop.
+        # After PaddleOCR released GPU memory, Ollama needs to load the
+        # model fresh. This avoids cold-start cost on the first real page.
+        _warmup_ollama(self.model, self.host)
 
         for pr in flagged_pages:
             ocr_text = pr.extraction.all_text()

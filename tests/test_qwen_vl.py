@@ -96,7 +96,7 @@ class TestParseVerificationResponse:
         raw = "I cannot process this image."
         result = _parse_verification_response(raw)
         assert result.is_accurate is False
-        assert "Unparseable" in result.summary or "No JSON" in result.summary
+        assert result.summary  # prose fallback populates summary
 
     def test_empty_response(self):
         result = _parse_verification_response("")
@@ -146,7 +146,7 @@ class TestApplyCorrections:
                 text=text,
                 bbox=BoundingBox(10, 10, 200, 30),
                 page_num=0,
-                source="tesseract_ocr",
+                source="paddleocr",
             )
         ]
         tables = []
@@ -159,7 +159,7 @@ class TestApplyCorrections:
             text_blocks=blocks,
             tables=tables,
             images=[],
-            source="tesseract_ocr",
+            source="paddleocr",
             page_width=612,
             page_height=792,
             page_type=PageType.SCANNED,
@@ -358,7 +358,7 @@ class TestVerifyFlaggedPages:
             ],
             tables=[],
             images=[],
-            source="tesseract_ocr",
+            source="paddleocr",
             page_width=612,
             page_height=792,
             page_type=PageType.SCANNED,

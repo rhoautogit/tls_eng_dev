@@ -20,12 +20,14 @@ from ..layer2.coverage_scorer import CoverageScorer
 from ..layer3.gap_analyzer import GapAnalyzer
 from ..layer3.parameter_adjuster import ParameterAdjuster
 from ..models import (
+    BoundingBox,
     ExtractionParameters,
     PageClassification,
     PageExtractionResult,
     PageResult,
     PageType,
     RunRecord,
+    TextBlock,
     VerificationStatus,
 )
 from ..rich_extractor import extract_rich_page, save_rich_page
@@ -43,6 +45,59 @@ def _extract_rich_text(rich_data: Dict[str, Any]) -> str:
                 if text.strip():
                     parts.append(text)
     return " ".join(parts)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Fast approximate text similarity using character frequency comparison.
+
+    Avoids O(n^2) SequenceMatcher on large documents. Compares character
+    frequency distributions, which is enough to detect garbled font encoding
+    (completely different character sets) vs normal text.
+    """
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    a_lower, b_lower = a.lower(), b.lower()
+    # Character frequency comparison
+    from collections import Counter
+    freq_a = Counter(a_lower)
+    freq_b = Counter(b_lower)
+    all_chars = set(freq_a) | set(freq_b)
+    if not all_chars:
+        return 1.0
+    intersection = sum(min(freq_a.get(c, 0), freq_b.get(c, 0)) for c in all_chars)
+    total = max(sum(freq_a.values()), sum(freq_b.values()))
+    return intersection / total if total > 0 else 1.0
+
+
+def _rich_data_to_text_blocks(
+    rich_data: Dict[str, Any], page_num: int,
+) -> List["TextBlock"]:
+    """Convert rich visual JSON text data into TextBlock objects."""
+    blocks: List[TextBlock] = []
+    for block in rich_data.get("text_blocks", []):
+        block_bbox = block.get("bbox", [0, 0, 0, 0])
+        parts = []
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if text.strip():
+                    parts.append(text)
+        if parts:
+            blocks.append(TextBlock(
+                text=" ".join(parts),
+                bbox=BoundingBox(
+                    x0=block_bbox[0] if len(block_bbox) > 0 else 0,
+                    y0=block_bbox[1] if len(block_bbox) > 1 else 0,
+                    x1=block_bbox[2] if len(block_bbox) > 2 else 0,
+                    y1=block_bbox[3] if len(block_bbox) > 3 else 0,
+                ),
+                page_num=page_num,
+                confidence=1.0,
+                source="rich_extractor",
+            ))
+    return blocks
 
 
 class DigitalPathExecutor:
@@ -105,12 +160,28 @@ class DigitalPathExecutor:
 
         # -- Step 3: Rich extraction (PyMuPDF) --
         rich_text = ""
+        rich_data = {}
         try:
             rich_data = extract_rich_page(pdf_path, page_num)
             save_rich_page(rich_data, output_base / "rich", page_num)
             rich_text = _extract_rich_text(rich_data)
         except Exception as e:
             logger.warning("Rich extraction failed p%d: %s", page_num + 1, e)
+
+        # -- Step 3b: Fallback to rich extractor if pdfplumber text is garbled --
+        if rich_text and extraction.text_blocks:
+            pp_text = " ".join(b.text for b in extraction.text_blocks if b.text.strip())
+            similarity = _text_similarity(pp_text, rich_text)
+            if similarity < 0.80:
+                logger.info(
+                    "Page %d [DIGITAL] pdfplumber/rich text similarity=%.1f%%, "
+                    "replacing text blocks with rich extractor output",
+                    page_num + 1, similarity * 100,
+                )
+                extraction.text_blocks = _rich_data_to_text_blocks(
+                    rich_data, page_num,
+                )
+                extraction.source = "rich_extractor"
 
         # -- Step 4: Coverage scoring --
         detailed = self._scorer.score_page_detailed(
@@ -149,11 +220,23 @@ class DigitalPathExecutor:
                 classification=classification,
             )
 
+        # Generate initial gap map before retries (only for pages below threshold)
+        initial_gap_map_paths: List[str] = []
+        try:
+            gap_map_dir = output_base / "gap_maps"
+            _, initial_gap_map = self._gap_analyzer.analyze(
+                pdf_path, page_num, extraction, gap_map_dir, retry_num=0,
+            )
+            initial_gap_map_paths.append(initial_gap_map)
+        except Exception as e:
+            logger.warning("Gap analysis failed p%d: %s", page_num + 1, e)
+
         # -- Step 5: Retry loop (pdfplumber only, no OpenCV) --
         best_extraction, best_score, run_records, gap_map_paths = \
             self._retry_loop(
                 pdf_path, page_num, extraction, layer1_score, params, output_base,
             )
+        gap_map_paths = initial_gap_map_paths + gap_map_paths
 
         # Re-score after retries
         detailed_after = self._scorer.score_page_detailed(

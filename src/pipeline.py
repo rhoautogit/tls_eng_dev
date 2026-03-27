@@ -1,17 +1,16 @@
-"""Main pipeline orchestrator.
+"""Main pipeline orchestrator (PaddleOCR variant).
 
-Branched architecture (v6): classifies each page as digital, scanned,
+Branched architecture (v7): classifies each page as digital, scanned,
 or hybrid, then routes to the appropriate extraction path.
 
   Stage 1  Page type detection (digital / scanned / hybrid)
   Stage 2  Path execution:
            - Digital:  pdfplumber + PyMuPDF -> coverage scoring -> retry loop
-           - Scanned:  Tesseract OCR (CPU) + OpenCV -> confidence gate ->
-                       inline Qwen-VL verification (GPU) if below threshold
-           - Hybrid:   region split -> digital tools + scanned tools ->
-                       inline Qwen-VL on scanned regions -> merge
+           - Scanned:  PaddleOCR + OpenCV -> confidence gate -> retry loop
+           - Hybrid:   region split -> digital tools + PaddleOCR -> merge
   Stage 3  5-layer validation engine (coverage, accuracy, completeness,
            structural, cross-validation)
+  Stage 3b Qwen-VL verification (flagged pages only, via Ollama)
   Stage 4  Reporting (JSON + HTML + CSV) with validation metrics
 
 Saves extracted content (text, tables, images) to organised output directories
@@ -19,8 +18,10 @@ and generates a Validation Report with per-page metrics and flagged items.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,9 +46,10 @@ from .models import (
     PageType,
     VerificationStatus,
 )
+from .paddle_ocr_engine import PaddleOCREngine
 from .page_classifier import PageClassifier
 from .paths import DigitalPathExecutor, ScannedPathExecutor, HybridPathExecutor
-from .qwen_vl_verifier import QwenVLVerifier
+from .qwen_vl_verifier import QwenVLVerifier, apply_corrections
 from .reporting.report_generator import ReportGenerator
 from .validation import ValidationEngine
 from .image_intelligence import process_image_file
@@ -236,9 +238,6 @@ class PDFPipeline:
         self._gap_analyzer = GapAnalyzer(self.config)
         self._adjuster = ParameterAdjuster(self.config)
 
-        # Qwen-VL verifier (GPU, runs inline during scanned/hybrid extraction)
-        self._qwen_verifier = QwenVLVerifier(self.config)
-
         # Path executors (Stage 2)
         self._digital_path = DigitalPathExecutor(
             self.config,
@@ -252,7 +251,7 @@ class PDFPipeline:
             self.config,
             self._cv,
             self._scorer,
-            qwen_verifier=self._qwen_verifier,
+            self._gap_analyzer,
         )
         self._hybrid_path = HybridPathExecutor(
             self.config,
@@ -260,11 +259,14 @@ class PDFPipeline:
             self._cv,
             self._custom,
             self._scorer,
-            qwen_verifier=self._qwen_verifier,
+            self._gap_analyzer,
         )
 
         # Validation engine (Stage 3)
         self._validator = ValidationEngine(self.config)
+
+        # Qwen-VL verifier (Stage 3b -- runs on flagged pages)
+        self._qwen_verifier = QwenVLVerifier(self.config)
 
         # Reporting (Stage 4)
         self._reporter = ReportGenerator(self.config)
@@ -295,6 +297,10 @@ class PDFPipeline:
         print(f"  Processing: {Path(pdf_path).name} ({total_pages} pages)")
         print(f"{'='*60}\n")
 
+        # Free Ollama VRAM so PaddleOCR gets the full GPU
+        from .qwen_vl_verifier import _unload_ollama_models
+        _unload_ollama_models()
+
         # Stage 1: Classify all pages upfront
         t0 = time.perf_counter()
         classifications = self._classifier.classify_document(pdf_path)
@@ -323,33 +329,89 @@ class PDFPipeline:
             unit="page",
             bar_format="  {desc}: {bar:30} {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
+        gpu_flush_interval = 50  # Release PaddleOCR engine every N OCR pages
+        ocr_pages_since_flush = 0
+
         for page_num in page_bar:
             classification = classifications[page_num]
             page_bar.set_postfix_str(
                 f"p{page_num + 1} [{classification.page_type.value}]"
             )
 
-            # Stage 2: Route to appropriate path
-            page_result = self._process_page(
-                pdf_path, page_num, classification, default_params, output_base,
-            )
+            try:
+                # Stage 2: Route to appropriate path
+                page_result = self._process_page(
+                    pdf_path, page_num, classification, default_params, output_base,
+                )
 
-            # Stage 3: Validation
-            validation = self._validator.validate(
-                pdf_path, page_num, page_result.extraction,
-            )
-            page_result.validation = validation
-            page_result.final_score = validation.composite_score
-            page_result.passed = validation.passed
+                # Stage 3: Validation
+                validation = self._validator.validate(
+                    pdf_path, page_num, page_result.extraction,
+                )
+                page_result.validation = validation
+                page_result.final_score = validation.composite_score
+                page_result.passed = validation.passed
 
-            # Collect flagged items
-            flagged = self._validator.get_flagged_items(
-                pdf_path, page_num, page_result.extraction, validation,
-            )
-            all_flagged_items.extend(flagged)
+                # Collect flagged items
+                flagged = self._validator.get_flagged_items(
+                    pdf_path, page_num, page_result.extraction, validation,
+                )
+                all_flagged_items.extend(flagged)
 
-            page_results.append(page_result)
-            _save_page_output(page_result.extraction, output_base, pdf_path)
+                # Generate gap map only for pages that fail validation
+                # (deferred from extraction to avoid unnecessary memory use)
+                if not validation.passed and not page_result.gap_map_paths:
+                    try:
+                        gap_map_dir = output_base / "gap_maps"
+                        _, gap_map = self._gap_analyzer.analyze(
+                            pdf_path, page_num, page_result.extraction,
+                            gap_map_dir, retry_num=0,
+                        )
+                        page_result.gap_map_paths.append(gap_map)
+                    except Exception as gme:
+                        logger.warning(
+                            "Gap map generation failed p%d: %s", page_num + 1, gme
+                        )
+
+                page_results.append(page_result)
+                _save_page_output(page_result.extraction, output_base, pdf_path)
+
+                # Track OCR pages for GPU flush
+                if classification.page_type in (PageType.SCANNED, PageType.HYBRID):
+                    ocr_pages_since_flush += 1
+            except Exception as e:
+                logger.error("Page %d failed: %s", page_num + 1, e, exc_info=True)
+                sys.stderr.flush()
+                # Create a minimal result so the pipeline continues
+                page_results.append(PageResult(
+                    page_num=page_num,
+                    extraction=PageExtractionResult(
+                        page_num=page_num,
+                        text_blocks=[],
+                        tables=[],
+                        images=[],
+                        source="error",
+                    ),
+                    final_score=0.0,
+                    passed=False,
+                ))
+            finally:
+                gc.collect()
+                try:
+                    import paddle
+                    if paddle.device.is_compiled_with_cuda():
+                        paddle.device.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                # Periodically release PaddleOCR to free GPU memory on large PDFs
+                if ocr_pages_since_flush >= gpu_flush_interval:
+                    logger.info(
+                        "Flushing PaddleOCR engine after %d OCR pages to free GPU memory",
+                        ocr_pages_since_flush,
+                    )
+                    PaddleOCREngine.release_shared()
+                    ocr_pages_since_flush = 0
 
         stage_times["Extraction + Validation"] = time.perf_counter() - t0
 
@@ -358,6 +420,17 @@ class PDFPipeline:
         extractions = [r.extraction for r in page_results]
         stitch_multipage_tables(extractions)
         stage_times["Table stitching"] = time.perf_counter() - t0
+
+        # Aggressively release ALL PaddlePaddle GPU memory before Qwen-VL loads.
+        # On 8GB GPUs, PaddlePaddle's CUDA context can hold 1-2GB even after
+        # release_shared(), which starves Ollama and causes Qwen-VL timeouts.
+        from .qwen_vl_verifier import _release_paddle_gpu
+        _release_paddle_gpu()
+
+        # Stage 3b: Qwen-VL verification on flagged pages
+        t0 = time.perf_counter()
+        self._run_qwen_verification(pdf_path, page_results, output_base)
+        stage_times["Qwen-VL verification"] = time.perf_counter() - t0
 
         # Save flagged items
         if all_flagged_items:
@@ -388,7 +461,7 @@ class PDFPipeline:
         print(f"\n{'='*60}")
         print(f"  PIPELINE COMPLETE")
         print(f"{'='*60}")
-        print(f"  Overall score:  {overall * 100:.1f}%")
+        print(f"  Avg. extraction score:  {overall * 100:.1f}%")
         print(f"  Flagged items:  {len(all_flagged_items)}")
         print(f"  Total time:     {total_time:.1f}s")
         print(f"\n  Stage breakdown:")
@@ -424,6 +497,74 @@ class PDFPipeline:
             return self._hybrid_path.execute(
                 pdf_path, page_num, classification, default_params, output_base,
             )
+
+    def _run_qwen_verification(
+        self,
+        pdf_path: str,
+        page_results: List[PageResult],
+        output_base: Path,
+    ) -> None:
+        """Run Qwen-VL verification on pages flagged by the confidence gate.
+
+        Updates extraction data and verification status in-place.
+        """
+        verifications = self._qwen_verifier.verify_flagged_pages(
+            pdf_path, page_results
+        )
+
+        if not verifications:
+            return
+
+        import json as _json
+        verification_dir = output_base / "verification"
+        verification_dir.mkdir(parents=True, exist_ok=True)
+
+        for page_num, response in verifications.items():
+            pr = page_results[page_num]
+
+            # Save verification response
+            (verification_dir / f"page_{page_num + 1:03d}_qwen_vl.json").write_text(
+                _json.dumps(response.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            # Apply corrections if any
+            if response.has_corrections:
+                pr.extraction, was_modified = apply_corrections(
+                    pr.extraction, response
+                )
+                if was_modified:
+                    pr.extraction.verification_status = VerificationStatus.QWEN_CORRECTED
+                    logger.info(
+                        "Page %d: Qwen-VL applied %d corrections, %d missing text items",
+                        page_num + 1,
+                        len(response.corrections),
+                        len(response.missing_text),
+                    )
+                else:
+                    pr.extraction.verification_status = VerificationStatus.QWEN_VERIFIED
+            elif response.is_accurate:
+                pr.extraction.verification_status = VerificationStatus.QWEN_VERIFIED
+                logger.info(
+                    "Page %d: Qwen-VL confirmed OCR is accurate (confidence=%.1f%%)",
+                    page_num + 1, response.confidence * 100,
+                )
+            else:
+                # Qwen-VL ran but couldn't confirm accuracy
+                pr.extraction.verification_status = VerificationStatus.PENDING_HUMAN
+                logger.info(
+                    "Page %d: Qwen-VL inconclusive, marking for human review",
+                    page_num + 1,
+                )
+
+        verified_count = sum(
+            1 for r in verifications.values()
+            if r.is_accurate or r.has_corrections
+        )
+        logger.info(
+            "Qwen-VL verification: %d/%d pages processed, %d verified/corrected",
+            len(verifications), len(page_results), verified_count,
+        )
 
     def _save_flagged_items(
         self, flagged_items: List[Dict[str, Any]], output_base: Path

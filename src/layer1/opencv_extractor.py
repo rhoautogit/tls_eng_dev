@@ -222,10 +222,9 @@ def text_in_bbox(words: List[Dict], bbox: BoundingBox) -> str:
 
 
 def _ocr_cell_from_image(img: np.ndarray, cell_px: BoundingBox) -> str:
-    """Run Tesseract OCR on a cropped cell region of the page image."""
+    """Run PaddleOCR on a cropped cell region of the page image."""
     try:
-        import pytesseract
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        from ..paddle_ocr_engine import PaddleOCREngine
         x0, y0 = int(cell_px.x0), int(cell_px.y0)
         x1, y1 = int(cell_px.x1), int(cell_px.y1)
         h, w = img.shape[:2]
@@ -234,31 +233,36 @@ def _ocr_cell_from_image(img: np.ndarray, cell_px: BoundingBox) -> str:
         if x1 - x0 < 5 or y1 - y0 < 5:
             return ""
         crop = img[y0:y1, x0:x1]
-        text = pytesseract.image_to_string(crop, config="--psm 6").strip()
-        return text
+        engine = PaddleOCREngine.get_shared({})
+        result = engine.ocr(crop)
+        if not result or not result[0]:
+            return ""
+        texts = [line[1][0] for line in result[0] if line[1]]
+        return " ".join(texts).strip()
     except Exception:
         return ""
 
 
 def _ocr_full_page(img: np.ndarray) -> List[Dict]:
-    """Run Tesseract OCR on the full page image and return word positions."""
+    """Run PaddleOCR on the full page image and return word positions."""
     try:
-        import pytesseract
-        from PIL import Image as PILImage
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        pil_img = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        data = pytesseract.image_to_data(pil_img, config="--psm 6", output_type=pytesseract.Output.DICT)
+        from ..paddle_ocr_engine import PaddleOCREngine
+        engine = PaddleOCREngine.get_shared({})
+        result = engine.ocr(img)
         words = []
-        for i in range(len(data["text"])):
-            text = data["text"][i].strip()
-            if not text or int(data["conf"][i]) < 30:
+        if not result or not result[0]:
+            return words
+        for line in result[0]:
+            box, (text, conf) = line[0], line[1]
+            if not text.strip() or conf < 0.3:
                 continue
-            x = data["left"][i]
-            y = data["top"][i]
-            w = data["width"][i]
-            h = data["height"][i]
-            words.append({"x0": float(x), "y0": float(y),
-                          "x1": float(x + w), "y1": float(y + h), "text": text})
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            words.append({
+                "x0": float(min(xs)), "y0": float(min(ys)),
+                "x1": float(max(xs)), "y1": float(max(ys)),
+                "text": text.strip(),
+            })
         return words
     except Exception as e:
         logger.debug("Full page OCR failed: %s", e)
@@ -307,7 +311,7 @@ class OpenCVExtractor:
         gray = preprocess_for_table_detection(work_img, params)
         horizontal, vertical = detect_lines(gray, params)
 
-        # If scanned page (no text layer), use Tesseract OCR for word positions
+        # If scanned page (no text layer), use PaddleOCR for word positions
         ocr_word_positions: List[Dict] = []
         if is_scanned:
             ocr_word_positions = _ocr_full_page(work_img)

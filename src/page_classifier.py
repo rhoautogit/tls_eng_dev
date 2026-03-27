@@ -77,14 +77,17 @@ class PageClassifier:
 
         self.digital_min_chars: int = page_cfg.get(
             "digital_min_chars",
-            merger_cfg.get("digital_threshold", DEFAULT_DIGITAL_MIN_CHARS),
+            page_cfg.get("digital_char_threshold",
+                         merger_cfg.get("digital_threshold", DEFAULT_DIGITAL_MIN_CHARS)),
         )
         self.scanned_max_chars: int = page_cfg.get(
             "scanned_max_chars",
-            merger_cfg.get("scanned_threshold", DEFAULT_SCANNED_MAX_CHARS),
+            page_cfg.get("scanned_char_threshold",
+                         merger_cfg.get("scanned_threshold", DEFAULT_SCANNED_MAX_CHARS)),
         )
         self.large_image_ratio: float = page_cfg.get(
-            "large_image_ratio", DEFAULT_LARGE_IMAGE_RATIO,
+            "large_image_ratio",
+            page_cfg.get("image_coverage_threshold", DEFAULT_LARGE_IMAGE_RATIO),
         )
 
     def classify_page(

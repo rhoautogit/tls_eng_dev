@@ -1,4 +1,4 @@
-"""Hybrid path executor.
+"""Hybrid path executor (PaddleOCR).
 
 Handles pages that contain both digital text regions and scanned/image
 regions on the same page. Splits the page into regions, routes each
@@ -7,7 +7,7 @@ to the appropriate extraction tools, then merges into a unified result.
 Flow:
   Region Splitter -> identifies digital vs scanned zones
   -> Digital regions: pdfplumber + PyMuPDF
-  -> Scanned regions: Tesseract OCR + OpenCV
+  -> Scanned regions: PaddleOCR + OpenCV
   -> If scanned OCR confidence < threshold: retry loop with escalating
      preprocessing (same strategies as scanned path)
   -> Unified Page Merger
@@ -17,15 +17,20 @@ Flow:
 """
 from __future__ import annotations
 
+import gc
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+import paddle
+
 from ..layer1.custom_table_logic import CustomTableLogic
 from ..layer1.opencv_extractor import OpenCVExtractor
 from ..layer1.pdfplumber_extractor import PDFPlumberExtractor
 from ..layer2.coverage_scorer import CoverageScorer
+from ..layer3.gap_analyzer import GapAnalyzer
 from ..models import (
     BoundingBox,
     ConfidenceGate,
@@ -41,8 +46,15 @@ from ..models import (
 )
 from ..rich_extractor import extract_rich_page, save_rich_page
 from ..ocr_rich_extractor import extract_rich_page_ocr
-from ..qwen_vl_verifier import QwenVLVerifier, apply_corrections
+from ..paddle_ocr_engine import PaddleOCREngine
 from .region_splitter import RegionSplitter
+from .scanned_path import (
+    build_extraction_from_paddle,
+    compute_confidence_gate,
+    preprocess_for_ocr,
+    preprocess_for_retry,
+    render_page_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +81,16 @@ class HybridPathExecutor:
         opencv_extractor: OpenCVExtractor,
         custom_table_logic: CustomTableLogic,
         scorer: CoverageScorer,
-        qwen_verifier: Optional[QwenVLVerifier] = None,
+        gap_analyzer: Optional[GapAnalyzer] = None,
     ) -> None:
         self.config = config
         self._pp = pdfplumber_extractor
         self._cv = opencv_extractor
         self._custom = custom_table_logic
         self._scorer = scorer
-        self._qwen = qwen_verifier
+        self._gap_analyzer = gap_analyzer
         self._splitter = RegionSplitter(config)
+        self._engine = PaddleOCREngine.get_shared(config)
 
         self._threshold: float = float(config.get("accuracy_threshold", 0.95))
 
@@ -99,11 +112,15 @@ class HybridPathExecutor:
 
         1. Split page into digital and scanned regions
         2. Extract digital regions with pdfplumber + PyMuPDF
-        3. Extract scanned regions with OCR + OpenCV
+        3. Extract scanned regions with PaddleOCR + OpenCV
         4. If scanned OCR confidence < threshold: retry loop
         5. Merge into unified page result
         6. Dual scoring
         """
+        default_dpi = int(
+            self.config.get("scanned_path", {}).get("ocr", {}).get("dpi", 300)
+        )
+
         # -- Step 1: Region splitting --
         regions = self._splitter.split_page(pdf_path, page_num)
         has_digital = any(r.region_type == PageType.DIGITAL for r in regions)
@@ -135,21 +152,44 @@ class HybridPathExecutor:
             except Exception as e:
                 logger.warning("Rich extraction failed on hybrid p%d: %s", page_num + 1, e)
 
-        # -- Step 3: Scanned extraction --
+        # -- Step 3: Scanned extraction with PaddleOCR --
         scanned_extraction = None
         ocr_confidence_gate = None
         run_records: List[RunRecord] = []
 
         if has_scanned:
+            # Render page and run PaddleOCR
             try:
-                ocr_rich_data = extract_rich_page_ocr(pdf_path, page_num)
-                scanned_extraction = self._build_ocr_extraction(
-                    ocr_rich_data, page_num,
+                img_bgr, pw, ph = render_page_image(
+                    pdf_path, page_num, dpi=default_dpi
+                )
+                img_h, img_w = img_bgr.shape[:2]
+
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                preprocessed = preprocess_for_ocr(gray, self.config)
+
+                ocr_result = self._engine.ocr_image(preprocessed)
+
+                # Table structure detection
+                paddle_tables = self._engine.detect_table_structure(img_bgr)
+                ocr_result.tables = paddle_tables
+
+                scanned_extraction = build_extraction_from_paddle(
+                    ocr_result, page_num,
                     classification.page_width, classification.page_height,
+                    img_w, img_h,
+                )
+
+                ocr_confidence_gate = compute_confidence_gate(
+                    ocr_result, self.config
                 )
             except Exception as e:
-                logger.warning("OCR extraction failed on hybrid p%d: %s", page_num + 1, e)
+                logger.warning(
+                    "PaddleOCR extraction failed on hybrid p%d: %s",
+                    page_num + 1, e,
+                )
 
+            # OpenCV table detection (merge non-overlapping)
             try:
                 cv_result = self._cv.extract_page(pdf_path, page_num, params)
                 if scanned_extraction:
@@ -159,28 +199,17 @@ class HybridPathExecutor:
             except Exception as e:
                 logger.warning("OpenCV failed on hybrid p%d: %s", page_num + 1, e)
 
-            # Confidence scoring on OCR regions
-            if scanned_extraction:
-                from .scanned_path import (
-                    _compute_page_confidence,
-                    _preprocess_for_ocr,
-                    _preprocess_for_retry,
-                    _render_page_image,
-                )
-                import cv2
-
-                img_bgr, _, _ = _render_page_image(pdf_path, page_num)
-                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-                preprocessed = _preprocess_for_ocr(gray, self.config)
-                ocr_confidence_gate = _compute_page_confidence(
-                    pdf_path, page_num, preprocessed, self.config,
-                )
-
+            # Confidence check and retry loop
+            if scanned_extraction and ocr_confidence_gate:
                 logger.info(
-                    "Page %d [HYBRID] initial OCR confidence: %.1f%% (%s)",
+                    "Page %d [HYBRID] initial PaddleOCR confidence: %.1f%% (%s) | "
+                    "words=%d high=%d flagged=%d",
                     page_num + 1,
                     ocr_confidence_gate.ocr_confidence * 100,
                     ocr_confidence_gate.level.value,
+                    ocr_confidence_gate.word_count,
+                    ocr_confidence_gate.high_confidence_words,
+                    ocr_confidence_gate.flagged_words,
                 )
 
                 # -- Step 4: Retry loop for scanned regions --
@@ -195,62 +224,7 @@ class HybridPathExecutor:
                             params,
                         )
 
-        # -- Step 5: Inline Qwen-VL verification on scanned regions (GPU) --
-        if (ocr_confidence_gate and ocr_confidence_gate.needs_qwen_vl
-                and self._qwen and self._qwen.is_available()
-                and scanned_extraction):
-            logger.info(
-                "Page %d [HYBRID] running inline Qwen-VL on scanned regions "
-                "(confidence=%.1f%%)",
-                page_num + 1, ocr_confidence_gate.ocr_confidence * 100,
-            )
-            ocr_text = scanned_extraction.all_text()
-            table_text = ""
-            if scanned_extraction.tables:
-                table_parts = []
-                for ti, table in enumerate(scanned_extraction.tables, 1):
-                    table_parts.append(f"Table {ti}:")
-                    if table.headers:
-                        table_parts.append(" | ".join(table.headers))
-                        table_parts.append("-" * 40)
-                    for row in table.data:
-                        table_parts.append(" | ".join(str(c) for c in row))
-                    table_parts.append("")
-                table_text = "\n".join(table_parts)
-
-            qwen_response = self._qwen.verify_page(
-                pdf_path, page_num, ocr_text, table_text
-            )
-
-            if qwen_response.has_corrections:
-                scanned_extraction, was_modified = apply_corrections(
-                    scanned_extraction, qwen_response
-                )
-                if was_modified:
-                    qwen_status = VerificationStatus.QWEN_CORRECTED
-                    logger.info(
-                        "Page %d [HYBRID] Qwen-VL applied %d corrections, "
-                        "%d missing text items",
-                        page_num + 1,
-                        len(qwen_response.corrections),
-                        len(qwen_response.missing_text),
-                    )
-                else:
-                    qwen_status = VerificationStatus.QWEN_VERIFIED
-            elif qwen_response.is_accurate:
-                qwen_status = VerificationStatus.QWEN_VERIFIED
-                logger.info(
-                    "Page %d [HYBRID] Qwen-VL confirmed OCR accurate",
-                    page_num + 1,
-                )
-            else:
-                qwen_status = VerificationStatus.PENDING_HUMAN
-                logger.info(
-                    "Page %d [HYBRID] Qwen-VL inconclusive, marking for human review",
-                    page_num + 1,
-                )
-
-        # -- Step 6: Merge results --
+        # -- Step 5: Merge results --
         merged = self._merge_results(
             digital_extraction, scanned_extraction, page_num,
             classification.page_width, classification.page_height,
@@ -263,20 +237,23 @@ class HybridPathExecutor:
 
         # Set verification status
         if ocr_confidence_gate and ocr_confidence_gate.needs_qwen_vl:
-            if self._qwen and self._qwen.is_available():
-                merged.verification_status = qwen_status
-            else:
-                merged.verification_status = VerificationStatus.NOT_VERIFIED
+            merged.verification_status = VerificationStatus.NOT_VERIFIED
+            logger.info(
+                "Page %d [HYBRID] OCR regions flagged for Qwen-VL "
+                "(confidence=%.1f%%)",
+                page_num + 1,
+                ocr_confidence_gate.ocr_confidence * 100,
+            )
         else:
             merged.verification_status = VerificationStatus.AUTO_VERIFIED
 
-        # -- Step 7: Scoring --
+        # -- Step 6: Scoring --
         score = self._scorer.score_page(pdf_path, page_num, merged)
         initial_score = score
 
         contributions = {
             "pdfplumber": 0.0,
-            "tesseract_ocr": 0.0,
+            "paddleocr": 0.0,
             "opencv": 0.0,
             "total": round(score, 4),
         }
@@ -291,7 +268,7 @@ class HybridPathExecutor:
             contributions["total"] = round(score, 4)
 
         if ocr_confidence_gate:
-            contributions["tesseract_ocr"] = ocr_confidence_gate.ocr_confidence
+            contributions["paddleocr"] = ocr_confidence_gate.ocr_confidence
 
         logger.info(
             "Page %d [HYBRID] score: %.1f%%%s",
@@ -320,7 +297,7 @@ class HybridPathExecutor:
             classification=classification,
         )
 
-    # ── Retry loop for scanned regions ─────────────────────────────────────────
+    # -- Retry loop for scanned regions ----------------------------------------
 
     def _retry_scanned_regions(
         self,
@@ -332,18 +309,11 @@ class HybridPathExecutor:
         initial_gate: ConfidenceGate,
         params: ExtractionParameters,
     ) -> Tuple[PageExtractionResult, ConfidenceGate, List[RunRecord]]:
-        """Retry OCR on scanned regions with escalating preprocessing.
+        """Retry PaddleOCR on scanned regions with escalating preprocessing.
 
         Uses the same retry strategies as the scanned path (higher DPI,
         CLAHE, adaptive binarization, morphological cleanup).
         """
-        from .scanned_path import (
-            _compute_page_confidence,
-            _preprocess_for_retry,
-            _render_page_image,
-        )
-        import cv2
-
         best_extraction = initial_extraction
         best_gate = initial_gate
         best_confidence = initial_gate.ocr_confidence
@@ -363,16 +333,25 @@ class HybridPathExecutor:
             retry_dpi = int(strategy.get("dpi", 300 + retry_num * 100))
 
             logger.info(
-                "Page %d [HYBRID] OCR retry %d/%d (confidence=%.1f%%, dpi=%d)",
+                "Page %d [HYBRID] PaddleOCR retry %d/%d "
+                "(confidence=%.1f%%, dpi=%d) -- %s",
                 page_num + 1, retry_num, self._max_retries,
                 best_confidence * 100, retry_dpi,
+                strategy.get("description", ""),
             )
+
+            # Free previous image buffers before re-rendering
+            img_bgr = gray = preprocessed = None
+            gc.collect()
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
 
             # Re-render at higher DPI
             try:
-                img_bgr, _, _ = _render_page_image(
+                img_bgr, _, _ = render_page_image(
                     pdf_path, page_num, dpi=retry_dpi
                 )
+                img_h, img_w = img_bgr.shape[:2]
                 gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             except Exception as e:
                 logger.warning(
@@ -383,7 +362,7 @@ class HybridPathExecutor:
 
             # Escalated preprocessing
             try:
-                preprocessed = _preprocess_for_retry(gray, strategy)
+                preprocessed = preprocess_for_retry(gray, strategy)
             except Exception as e:
                 logger.warning(
                     "Hybrid retry %d preprocessing failed p%d: %s",
@@ -391,29 +370,30 @@ class HybridPathExecutor:
                 )
                 continue
 
-            # Re-run confidence scoring
+            # Re-run PaddleOCR
             try:
-                retry_gate = _compute_page_confidence(
-                    pdf_path, page_num, preprocessed, self.config
-                )
+                retry_ocr = self._engine.ocr_image(preprocessed)
+                retry_gate = compute_confidence_gate(retry_ocr, self.config)
             except Exception as e:
                 logger.warning(
-                    "Hybrid retry %d confidence scoring failed p%d: %s",
+                    "Hybrid retry %d PaddleOCR failed p%d: %s",
                     retry_num, page_num + 1, e,
                 )
                 continue
 
-            # Re-run OCR extraction if confidence improved
+            # Re-run extraction if confidence improved
             retry_extraction = best_extraction
             if retry_gate.ocr_confidence > best_confidence:
                 try:
-                    rich_data = extract_rich_page_ocr(
-                        pdf_path, page_num, dpi=retry_dpi
+                    # Table detection on retry image
+                    retry_tables = self._engine.detect_table_structure(img_bgr)
+                    retry_ocr.tables = retry_tables
+
+                    retry_extraction = build_extraction_from_paddle(
+                        retry_ocr, page_num, pw, ph, img_w, img_h
                     )
-                    retry_extraction = self._build_ocr_extraction(
-                        rich_data, page_num, pw, ph
-                    )
-                    # Re-run OpenCV tables
+
+                    # Merge OpenCV tables
                     try:
                         cv_result = self._cv.extract_page(
                             pdf_path, page_num, params
@@ -452,7 +432,7 @@ class HybridPathExecutor:
             ))
 
             logger.info(
-                "Page %d [HYBRID] OCR retry %d: confidence %.1f%% -> %.1f%% "
+                "Page %d [HYBRID] PaddleOCR retry %d: confidence %.1f%% -> %.1f%% "
                 "(delta=%.2f%%)",
                 page_num + 1, retry_num,
                 best_confidence * 100,
@@ -468,7 +448,7 @@ class HybridPathExecutor:
             # Check threshold
             if best_confidence >= self._threshold:
                 logger.info(
-                    "Page %d [HYBRID] OCR passed at retry %d "
+                    "Page %d [HYBRID] PaddleOCR passed at retry %d "
                     "(confidence=%.1f%%)",
                     page_num + 1, retry_num, best_confidence * 100,
                 )
@@ -479,58 +459,14 @@ class HybridPathExecutor:
             if len(recent_deltas) >= 2:
                 if all(d < self._early_stop_delta for d in recent_deltas[-2:]):
                     logger.info(
-                        "Page %d [HYBRID] OCR early stop at retry %d",
+                        "Page %d [HYBRID] PaddleOCR early stop at retry %d",
                         page_num + 1, retry_num,
                     )
                     break
 
         return best_extraction, best_gate, run_records
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _build_ocr_extraction(
-        self,
-        rich_data: Dict[str, Any],
-        page_num: int,
-        page_width: float,
-        page_height: float,
-    ) -> PageExtractionResult:
-        """Build extraction result from OCR rich data."""
-        text_blocks: List[TextBlock] = []
-
-        for block in rich_data.get("text_blocks", []):
-            for line in block.get("lines", []):
-                line_text_parts = []
-                line_bbox = None
-                for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    if text.strip():
-                        line_text_parts.append(text)
-                        bbox = span.get("bbox")
-                        if bbox and not line_bbox:
-                            line_bbox = BoundingBox(
-                                bbox[0], bbox[1], bbox[2], bbox[3]
-                            )
-                if line_text_parts and line_bbox:
-                    text_blocks.append(TextBlock(
-                        text=" ".join(line_text_parts),
-                        bbox=line_bbox,
-                        page_num=page_num,
-                        confidence=0.9,
-                        source="tesseract_ocr",
-                    ))
-
-        return PageExtractionResult(
-            page_num=page_num,
-            text_blocks=text_blocks,
-            tables=[],
-            images=[],
-            source="tesseract_ocr",
-            is_scanned=True,
-            page_width=page_width,
-            page_height=page_height,
-            page_type=PageType.SCANNED,
-        )
+    # -- Helpers ---------------------------------------------------------------
 
     def _merge_opencv_tables(
         self,
@@ -538,6 +474,9 @@ class HybridPathExecutor:
         cv_result: PageExtractionResult,
     ) -> PageExtractionResult:
         """Merge OpenCV tables into extraction without duplicates."""
+        if not cv_result.tables:
+            return extraction
+
         for cv_table in cv_result.tables:
             overlap = any(
                 t.bbox.iou(cv_table.bbox) > 0.3 for t in extraction.tables

@@ -3,7 +3,7 @@
 ## Project Overview
 Three-layer PDF ingestion and evaluation pipeline for TLS Engineering.
 Processes ~500 engineering PDFs/quarter. No external API calls (data compliance).
-All processing is local -- Tesseract for OCR, Ollama for Qwen-VL, no cloud services.
+All processing is local -- PaddleOCR (GPU) for OCR, Ollama for Qwen-VL, no cloud services.
 
 ## Quick Start
 ```bash
@@ -36,11 +36,12 @@ Three branched paths based on page classification:
 - `src/paths/digital_path.py` -- digital PDF processing
 - `src/layer1/pdfplumber_extractor.py` -- text + table extraction (lattice/stream modes)
 - `src/layer2/coverage_scorer.py` -- PyMuPDF baseline coverage check
+- Rich extractor fallback if pdfplumber text is garbled (< 80% similarity)
 - Retry loop (max 3): switch mode+loosen, CLAHE+sharpen, full combined
 
 **Scanned Path**
 - `src/paths/scanned_path.py` -- scanned PDF processing
-- OpenCV preprocessing (gray + CLAHE + threshold) -> Tesseract OCR (CPU) -> confidence gate
+- OpenCV preprocessing (gray + CLAHE + threshold) -> PaddleOCR (GPU) -> confidence gate
 - Confidence gate: HIGH (>= 95%), MEDIUM (85-95%), LOW (< 85%)
 - OCR retry loop (max 3): DPI 400 -> 450 -> 600 with escalating CLAHE + adaptive binarize + morphological cleanup
 - Early stop if delta < 1% for 2 consecutive retries
@@ -50,18 +51,19 @@ Three branched paths based on page classification:
 **Hybrid Path**
 - `src/paths/hybrid_path.py` -- hybrid page processing
 - `src/paths/region_splitter.py` -- splits page into digital + scanned regions
-- Digital regions -> pdfplumber, scanned regions -> Tesseract OCR (CPU)
+- Digital regions -> pdfplumber, scanned regions -> PaddleOCR (GPU)
 - Confidence gate on scanned regions, retry loop reuses scanned path strategies
 - If scanned region confidence still below threshold, runs Qwen-VL (GPU) inline on scanned regions
 - Merge + dedup results
 
 **Shared Extraction Modules**
+- `src/paddle_ocr_engine.py` -- PaddleOCR engine wrapper (GPU, shared singleton with periodic memory flush)
 - `src/layer1/opencv_extractor.py` -- image-based grid detection via morphological ops
 - `src/layer1/result_merger.py` -- parallel results merged; digital prefers pdfplumber (0.7w), scanned prefers opencv (0.7w)
 - `src/layer1/custom_table_logic.py` -- implicit table detection, merged cells, nested headers, multi-page stitch
 - `src/ocr_rich_extractor.py` -- OCR extraction with rich metadata
 - `src/rich_extractor.py` -- rich extraction for digital pages
-- `src/image_intelligence.py` -- image captioning/classification
+- `src/image_intelligence.py` -- image captioning/classification (placeholder for Phase 2)
 
 ### Stage 3: 5-Layer Validation
 - `src/validation/validation_engine.py` -- composite scoring:
@@ -74,12 +76,12 @@ Three branched paths based on page classification:
 
 ### Qwen-VL Verifier (inline, GPU)
 - `src/qwen_vl_verifier.py` -- called inline by scanned/hybrid paths when OCR confidence is below threshold
-- Tesseract runs on CPU, Qwen-VL runs on GPU via Ollama
+- PaddleOCR runs on GPU, Qwen-VL runs on GPU via Ollama
 - Renders page as PNG (200 DPI) -> sends image + OCR text to Qwen3-VL (8B) via Ollama -> JSON corrections
 - Output statuses: `QWEN_VERIFIED`, `QWEN_CORRECTED`, or `PENDING_HUMAN`
 
 ### Stage 4: Reporting
-- `src/reporting/report_generator.py` -- JSON + HTML (embedded gap maps) + CSV per document
+- `src/reporting/report_generator.py` -- JSON + HTML dashboard + CSV + accuracy PDF per document
 
 ### Layer 2 -- Coverage Scoring
 - `src/layer2/coverage_scorer.py` -- PyMuPDF baseline (excl. header 8% + footer 8% + page numbers)
@@ -96,10 +98,12 @@ Three branched paths based on page classification:
 output/{pdf_stem}/text/          -- .md + metadata .json per page
 output/{pdf_stem}/tables/        -- .csv + metadata .json per table
 output/{pdf_stem}/images/        -- PNG + metadata .json
-output/{pdf_stem}/gap_maps/      -- PNG gap maps per retry
+output/{pdf_stem}/gap_maps/      -- PNG gap maps (green=extracted, red=missed)
+output/{pdf_stem}/rich/          -- rich visual JSON per page
 output/{pdf_stem}/verification/  -- Qwen-VL results
 output/{pdf_stem}/validation/    -- flagged items
-reports/{pdf_stem}.json/.html/.csv
+reports/{pdf_stem}/{pdf_stem}.json/.html/.csv
+reports/{pdf_stem}/{pdf_stem}_accuracy.pdf
 ```
 
 ## Coordinate Systems
@@ -113,6 +117,7 @@ reports/{pdf_stem}.json/.html/.csv
 - Digital page: >= 100 embedded chars
 - Scanned page: < 20 embedded chars
 - OCR confidence gate: HIGH >= 95%, MEDIUM >= 85%, LOW < 85%
+- GPU memory flush: every 50 OCR pages
 
 ## Style Rules
 - Do not use em dashes in any output text. Use commas, periods, or parentheses instead.

@@ -1,18 +1,36 @@
+# TLS Engineering PDF Pipeline - PaddleOCR variant
+# Install: pip install -r requirements.txt
+#
+# Prerequisites:
+#   - Python 3.12.x (3.12.10 tested, 3.13 is NOT compatible with paddlepaddle-gpu)
+#   - NVIDIA GPU with CUDA 12.x drivers installed
+#   - Ollama installed separately (https://ollama.ai) then: ollama pull qwen3-vl:8b
+
+# -- PaddlePaddle GPU (CUDA 12) -----------------------------------------------
+--find-links https://www.paddlepaddle.org.cn/whl/windows/mkl/avx/stable.html
+paddlepaddle-gpu==2.6.1.post120
+paddleocr==2.9.1
+nvidia-cudnn-cu12<9
+
+# -- PDF extraction ------------------------------------------------------------
 pdfplumber>=0.10.0
-opencv-python>=4.8.0
 PyMuPDF>=1.23.0
+
+# -- Image processing ----------------------------------------------------------
+opencv-python>=4.8.0
 Pillow>=10.0.0
 numpy>=1.24.0
+
+# -- Data & config -------------------------------------------------------------
 pandas>=2.0.0
 PyYAML>=6.0
+
+# -- HTTP (Ollama API calls) ---------------------------------------------------
 requests>=2.31.0
+
+# -- Utilities -----------------------------------------------------------------
 tqdm>=4.65.0
+
+# -- Testing -------------------------------------------------------------------
 pytest>=7.4.0
 pytest-cov>=4.0.0
-
-# Image intelligence (OCR, captioning, embeddings)
-pytesseract>=0.3.10
-torch>=2.0.0
-torchvision>=0.15.0
-transformers>=4.30.0
-open_clip_torch>=2.20.0

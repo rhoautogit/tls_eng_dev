@@ -1,27 +1,30 @@
-"""Scanned path executor.
+"""Scanned path executor (PaddleOCR).
 
-Handles pages with no embedded text layer (fully scanned PDFs).
-Uses Tesseract OCR for text extraction and OpenCV for table/form detection.
-Applies confidence gating to flag pages for Qwen-VL verification.
+Handles pages with no usable embedded text layer (fully scanned PDFs or
+pages with garbled font encodings). Uses PaddleOCR for text detection and
+recognition, OpenCV for preprocessing, and Qwen-VL for verification of
+low-confidence pages.
+
+PaddleOCR runs as a subprocess so GPU memory is released before Qwen-VL
+loads through Ollama.
 
 Flow:
-  Preprocessing (deskew, binarize, noise/line removal)
-  -> Tesseract OCR (word-level text + confidence)
-  -> OpenCV (table structure, checkboxes)
-  -> Page Confidence Scoring
+  Render page image (PyMuPDF)
+  -> OpenCV preprocessing (deskew, denoise, binarize, CLAHE)
+  -> PaddleOCR (text detection + recognition + table structure)
+  -> Confidence gate evaluates results
   -> If below threshold: retry loop with escalating preprocessing
      Retry 1: Higher DPI + CLAHE contrast enhancement
      Retry 2: Max DPI + aggressive CLAHE + adaptive binarization
      Retry 3: Full combined -- max DPI, max CLAHE, morphological cleanup
-  -> Confidence Gate:
-     High (>95%):  auto-verified
-     Medium (85-95%): flagged for Qwen-VL
-     Low (<85%):  flagged for Qwen-VL + human review
+  -> If confidence still low: Qwen-VL corrects flagged pages
   -> Output
 """
 from __future__ import annotations
 
+import gc
 import logging
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,10 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import fitz
 import numpy as np
+import paddle
 
 from ..layer1.opencv_extractor import OpenCVExtractor
 from ..layer2.coverage_scorer import CoverageScorer
 from ..models import (
+    BoundingBox,
     ConfidenceGate,
     ConfidenceLevel,
     ExtractionParameters,
@@ -41,36 +46,28 @@ from ..models import (
     PageResult,
     PageType,
     RunRecord,
+    Table,
     TextBlock,
-    BoundingBox,
     VerificationStatus,
 )
-from ..ocr_rich_extractor import (
-    extract_rich_page_ocr,
-    is_scanned_page,
+from ..paddle_ocr_engine import (
+    OCRPageResult,
+    PaddleOCREngine,
+    run_paddleocr_subprocess,
 )
-from ..qwen_vl_verifier import QwenVLVerifier, apply_corrections
 
 logger = logging.getLogger(__name__)
 
 
-# ── Tesseract setup ──────────────────────────────────────────────────────────
+# -- Page rendering -----------------------------------------------------------
 
-def _get_tesseract():
-    """Import and configure pytesseract."""
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-    return pytesseract
-
-
-# ── Preprocessing (reuses logic from ocr_rich_extractor) ─────────────────────
-
-def _render_page_image(
+def render_page_image(
     pdf_path: str, page_num: int, dpi: int = 300
 ) -> Tuple[np.ndarray, float, float]:
-    """Render a PDF page to BGR numpy array."""
+    """Render a PDF page to BGR numpy array.
+
+    Returns (image_bgr, page_width_pts, page_height_pts).
+    """
     doc = fitz.open(pdf_path)
     page = doc[page_num]
     pw, ph = page.rect.width, page.rect.height
@@ -87,35 +84,35 @@ def _render_page_image(
     return img, pw, ph
 
 
-def _preprocess_for_ocr(gray: np.ndarray, config: Dict[str, Any]) -> np.ndarray:
-    """Run the preprocessing pipeline on a grayscale scan image.
+# -- OpenCV preprocessing ----------------------------------------------------
 
-    Imports and reuses the preprocessing functions from ocr_rich_extractor.
-    """
-    from ..ocr_rich_extractor import _deskew, _remove_lines, _remove_non_text_elements
-
+def preprocess_for_ocr(gray: np.ndarray, config: Dict[str, Any]) -> np.ndarray:
+    """Standard preprocessing pipeline for scanned page images."""
     scan_cfg = config.get("scanned_path", {}).get("preprocessing", {})
 
     if scan_cfg.get("deskew", True):
         gray = _deskew(gray)
-    if scan_cfg.get("line_removal", True):
-        gray = _remove_lines(gray)
-    if scan_cfg.get("noise_removal", True):
-        gray = _remove_non_text_elements(gray)
+    if scan_cfg.get("denoise", True):
+        gray = cv2.fastNlMeansDenoising(gray, h=10)
+    if scan_cfg.get("binarize", True):
+        gray = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+
+    clahe_cfg = scan_cfg.get("clahe", {})
+    if clahe_cfg:
+        clip = float(clahe_cfg.get("clip_limit", 2.0))
+        grid = tuple(clahe_cfg.get("tile_grid_size", [8, 8]))
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=grid)
+        gray = clahe.apply(gray)
 
     return gray
 
 
-def _preprocess_for_retry(
+def preprocess_for_retry(
     gray: np.ndarray, strategy: Dict[str, Any]
 ) -> np.ndarray:
-    """Run an escalated preprocessing pipeline for a retry attempt.
-
-    Each retry strategy can enable/disable preprocessing steps and
-    adjust their parameters (CLAHE clip limit, adaptive threshold, etc.).
-    """
-    from ..ocr_rich_extractor import _deskew, _remove_lines, _remove_non_text_elements
-
+    """Escalated preprocessing for a retry attempt."""
     if strategy.get("deskew", True):
         gray = _deskew(gray)
 
@@ -127,16 +124,16 @@ def _preprocess_for_retry(
         clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=grid)
         gray = clahe.apply(gray)
 
-    if strategy.get("line_removal", True):
-        gray = _remove_lines(gray)
     if strategy.get("denoise", True):
-        gray = _remove_non_text_elements(gray)
+        gray = cv2.fastNlMeansDenoising(gray, h=10)
 
-    # Adaptive binarization (more aggressive than default Otsu)
+    if strategy.get("line_removal", False):
+        gray = _remove_lines(gray)
+
+    # Adaptive binarization
     if strategy.get("adaptive_binarize", False):
         block_size = int(strategy.get("adaptive_block_size", 15))
         constant = int(strategy.get("adaptive_constant", 5))
-        # Ensure block_size is odd
         if block_size % 2 == 0:
             block_size += 1
         gray = cv2.adaptiveThreshold(
@@ -144,7 +141,7 @@ def _preprocess_for_retry(
             cv2.THRESH_BINARY, block_size, constant,
         )
 
-    # Morphological opening to clean up noise
+    # Morphological opening
     if strategy.get("morphological_open", False):
         kernel_size = tuple(strategy.get("morphological_kernel", [2, 2]))
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
@@ -153,61 +150,92 @@ def _preprocess_for_retry(
     return gray
 
 
-# ── Confidence scoring ───────────────────────────────────────────────────────
+def _deskew(gray: np.ndarray) -> np.ndarray:
+    """Detect and correct skew using Hough lines."""
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=100,
+        minLineLength=100, maxLineGap=10,
+    )
+    if lines is None or len(lines) == 0:
+        return gray
 
-def _compute_page_confidence(
-    pdf_path: str,
-    page_num: int,
-    preprocessed_gray: np.ndarray,
-    config: Dict[str, Any],
-) -> ConfidenceGate:
-    """Compute page-level OCR confidence from Tesseract word-level scores.
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if abs(angle) < 5:
+            angles.append(angle)
 
-    Runs Tesseract image_to_data on the preprocessed image to get per-word
-    confidence scores, then aggregates into a page-level metric.
-    """
-    pytesseract = _get_tesseract()
-    from PIL import Image as PILImage
+    if not angles:
+        return gray
 
-    pil_img = PILImage.fromarray(preprocessed_gray)
-    data = pytesseract.image_to_data(
-        pil_img, config="--psm 6", output_type=pytesseract.Output.DICT
+    median_angle = float(np.median(angles))
+    if abs(median_angle) < 0.1:
+        return gray
+
+    h, w = gray.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    rotated = cv2.warpAffine(
+        gray, M, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return rotated
+
+
+def _remove_lines(gray: np.ndarray) -> np.ndarray:
+    """Remove horizontal and vertical lines (table grids, form lines)."""
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    h, w = binary.shape
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, w // 20), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(30, h // 20)))
+
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+    lines_mask = cv2.bitwise_or(h_lines, v_lines)
+
+    # Inpaint the lines out
+    result = cv2.inpaint(gray, lines_mask, 3, cv2.INPAINT_TELEA)
+    return result
+
+
+# -- Coordinate conversion ----------------------------------------------------
+
+def _pixel_to_points(
+    bbox_px: List[float], img_width: int, img_height: int,
+    page_width_pt: float, page_height_pt: float,
+) -> BoundingBox:
+    """Convert pixel coordinates to PDF point coordinates."""
+    scale_x = page_width_pt / img_width
+    scale_y = page_height_pt / img_height
+    return BoundingBox(
+        x0=bbox_px[0] * scale_x,
+        y0=bbox_px[1] * scale_y,
+        x1=bbox_px[2] * scale_x,
+        y1=bbox_px[3] * scale_y,
     )
 
-    # Collect word confidences (skip empty/invalid entries)
-    word_confidences: List[float] = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        conf = int(data["conf"][i])
-        if not text or conf < 0:
-            continue
-        word_confidences.append(conf / 100.0)
 
-    if not word_confidences:
-        return ConfidenceGate(
-            ocr_confidence=0.0,
-            level=ConfidenceLevel.LOW,
-            needs_qwen_vl=True,
-            needs_human_review=True,
-            word_count=0,
-            high_confidence_words=0,
-            flagged_words=0,
-        )
+# -- Confidence gate ----------------------------------------------------------
 
-    avg_confidence = sum(word_confidences) / len(word_confidences)
-    high_conf_words = sum(1 for c in word_confidences if c >= 0.95)
-    flagged_words = sum(1 for c in word_confidences if c < 0.85)
-
-    # Determine confidence level from config thresholds
+def compute_confidence_gate(
+    ocr_result: OCRPageResult, config: Dict[str, Any]
+) -> ConfidenceGate:
+    """Evaluate OCR confidence and determine gating level."""
     gate_cfg = config.get("scanned_path", {}).get("confidence_gate", {})
     high_threshold = float(gate_cfg.get("high_threshold", 0.95))
     medium_threshold = float(gate_cfg.get("medium_threshold", 0.85))
 
-    if avg_confidence >= high_threshold:
+    conf = ocr_result.page_confidence
+
+    if conf >= high_threshold:
         level = ConfidenceLevel.HIGH
         needs_qwen = False
         needs_human = False
-    elif avg_confidence >= medium_threshold:
+    elif conf >= medium_threshold:
         level = ConfidenceLevel.MEDIUM
         needs_qwen = True
         needs_human = False
@@ -217,30 +245,92 @@ def _compute_page_confidence(
         needs_human = True
 
     return ConfidenceGate(
-        ocr_confidence=avg_confidence,
+        ocr_confidence=conf,
         level=level,
         needs_qwen_vl=needs_qwen,
         needs_human_review=needs_human,
-        word_count=len(word_confidences),
-        high_confidence_words=high_conf_words,
-        flagged_words=flagged_words,
+        word_count=ocr_result.word_count,
+        high_confidence_words=ocr_result.high_confidence_words,
+        flagged_words=ocr_result.flagged_words,
     )
 
 
+# -- Build extraction result from PaddleOCR output ---------------------------
+
+def build_extraction_from_paddle(
+    ocr_result: OCRPageResult,
+    page_num: int,
+    page_width: float,
+    page_height: float,
+    img_width: int,
+    img_height: int,
+) -> PageExtractionResult:
+    """Convert PaddleOCR result into a PageExtractionResult."""
+    text_blocks: List[TextBlock] = []
+
+    for line in ocr_result.lines:
+        bbox = _pixel_to_points(
+            line.bbox, img_width, img_height, page_width, page_height
+        )
+        text_blocks.append(TextBlock(
+            text=line.text,
+            bbox=bbox,
+            page_num=page_num,
+            confidence=line.confidence,
+            source="paddleocr",
+        ))
+
+    # Convert PaddleOCR tables
+    tables: List[Table] = []
+    for ocr_table in ocr_result.tables:
+        grid = ocr_table.to_grid()
+        if not grid:
+            continue
+
+        table_bbox = _pixel_to_points(
+            ocr_table.bbox, img_width, img_height, page_width, page_height
+        )
+
+        tables.append(Table(
+            data=grid,
+            bbox=table_bbox,
+            num_rows=ocr_table.num_rows,
+            num_cols=ocr_table.num_cols,
+            headers=grid[0] if grid else [],
+            page_num=page_num,
+            confidence=0.9,
+            source="paddleocr",
+        ))
+
+    return PageExtractionResult(
+        page_num=page_num,
+        text_blocks=text_blocks,
+        tables=tables,
+        images=[],
+        source="paddleocr",
+        is_scanned=True,
+        page_width=page_width,
+        page_height=page_height,
+        page_type=PageType.SCANNED,
+    )
+
+
+# -- Scanned path executor ----------------------------------------------------
+
 class ScannedPathExecutor:
-    """Executes the scanned extraction path for a single page."""
+    """Executes the scanned extraction path using PaddleOCR."""
 
     def __init__(
         self,
         config: Dict[str, Any],
         opencv_extractor: OpenCVExtractor,
         scorer: CoverageScorer,
-        qwen_verifier: Optional[QwenVLVerifier] = None,
+        gap_analyzer=None,
     ) -> None:
         self.config = config
         self._cv = opencv_extractor
         self._scorer = scorer
-        self._qwen = qwen_verifier
+        self._gap_analyzer = gap_analyzer
 
         self._threshold: float = float(config.get("accuracy_threshold", 0.95))
 
@@ -249,6 +339,9 @@ class ScannedPathExecutor:
         self._early_stop_delta: float = float(
             retry_cfg.get("early_termination_threshold", 0.01)
         )
+
+        # PaddleOCR engine (shared singleton to avoid re-initialization)
+        self._engine = PaddleOCREngine.get_shared(config)
 
     def execute(
         self,
@@ -261,57 +354,61 @@ class ScannedPathExecutor:
         """Run the scanned extraction path.
 
         1. Render page to image
-        2. Preprocess (deskew, line removal, noise removal)
-        3. OCR rich extraction (Tesseract + layout analysis)
-        4. OpenCV table/form detection
-        5. Confidence scoring and gating
-        6. If below threshold: retry loop with escalating preprocessing
+        2. OpenCV preprocessing
+        3. PaddleOCR text detection + recognition
+        4. PaddleOCR table structure recognition
+        5. OpenCV table detection (merge with PaddleOCR tables)
+        6. Confidence gate
+        7. Retry loop if below threshold
         """
-        # -- Step 1-2: Render and preprocess --
         default_dpi = int(
             self.config.get("scanned_path", {}).get("ocr", {}).get("dpi", 300)
         )
-        img_bgr, pw, ph = _render_page_image(pdf_path, page_num, dpi=default_dpi)
+
+        # -- Step 1: Render --
+        img_bgr, pw, ph = render_page_image(pdf_path, page_num, dpi=default_dpi)
+        img_h, img_w = img_bgr.shape[:2]
+
+        # -- Step 2: Preprocess --
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        preprocessed = _preprocess_for_ocr(gray, self.config)
+        preprocessed = preprocess_for_ocr(gray, self.config)
 
-        # -- Step 3: OCR rich extraction --
-        try:
-            rich_data = extract_rich_page_ocr(pdf_path, page_num)
-            from ..rich_extractor import save_rich_page
-            save_rich_page(rich_data, output_base / "rich", page_num)
-        except Exception as e:
-            logger.warning("OCR rich extraction failed p%d: %s", page_num + 1, e)
-            rich_data = {}
+        # -- Step 3: PaddleOCR (subprocess for GPU memory isolation) --
+        ocr_result = self._engine.ocr_image(preprocessed)
 
-        # Build extraction result from OCR data
-        extraction = self._build_extraction_from_ocr(
-            rich_data, page_num, pw, ph
+        # -- Step 5: Build extraction result --
+        extraction = build_extraction_from_paddle(
+            ocr_result, page_num, pw, ph, img_w, img_h
         )
 
-        # -- Step 4: OpenCV table/form detection --
+        # OpenCV table detection (merge non-overlapping)
         try:
             cv_result = self._cv.extract_page(pdf_path, page_num, params)
             extraction = self._merge_opencv_tables(extraction, cv_result)
         except Exception as e:
             logger.warning("OpenCV failed on scanned p%d: %s", page_num + 1, e)
 
-        # Tag as scanned
         extraction.page_type = PageType.SCANNED
         extraction.is_scanned = True
 
-        # -- Step 5: Confidence scoring --
-        confidence_gate = _compute_page_confidence(
-            pdf_path, page_num, preprocessed, self.config
-        )
+        # -- Step 5b: OCR rich extraction for PDF reconstruction --
+        try:
+            from ..ocr_rich_extractor import extract_rich_page_ocr
+            from ..rich_extractor import save_rich_page
+            rich_data = extract_rich_page_ocr(pdf_path, page_num)
+            save_rich_page(rich_data, output_base / "rich", page_num)
+        except Exception as e:
+            logger.warning("OCR rich extraction failed p%d: %s", page_num + 1, e)
+
+        # -- Step 6: Confidence gate --
+        confidence_gate = compute_confidence_gate(ocr_result, self.config)
         extraction.confidence_gate = confidence_gate
 
-        # Coverage scoring
         score = self._scorer.score_page(pdf_path, page_num, extraction)
         initial_score = score
 
         logger.info(
-            "Page %d [SCANNED] initial: OCR confidence=%.1f%% (%s) | "
+            "Page %d [SCANNED] initial: PaddleOCR confidence=%.1f%% (%s) | "
             "words=%d high=%d flagged=%d | coverage=%.1f%%",
             page_num + 1,
             confidence_gate.ocr_confidence * 100,
@@ -322,79 +419,30 @@ class ScannedPathExecutor:
             score * 100,
         )
 
-        # -- Step 6: Retry loop if below threshold --
+        # -- Step 7: Retry loop --
         run_records: List[RunRecord] = []
 
         if confidence_gate.ocr_confidence < self._threshold:
-            best_extraction, best_gate, best_score, run_records = \
+            best_extraction, best_gate, best_score, run_records = (
                 self._retry_loop(
                     pdf_path, page_num, pw, ph,
                     extraction, confidence_gate, score,
                     params, output_base,
                 )
+            )
             extraction = best_extraction
             confidence_gate = best_gate
             score = best_score
             extraction.confidence_gate = confidence_gate
 
-        # -- Step 7: Inline Qwen-VL verification (GPU) if still below threshold --
-        if confidence_gate.needs_qwen_vl and self._qwen and self._qwen.is_available():
-            logger.info(
-                "Page %d [SCANNED] running inline Qwen-VL verification (confidence=%.1f%%)",
-                page_num + 1, confidence_gate.ocr_confidence * 100,
-            )
-            ocr_text = extraction.all_text()
-            table_text = ""
-            if extraction.tables:
-                table_parts = []
-                for ti, table in enumerate(extraction.tables, 1):
-                    table_parts.append(f"Table {ti}:")
-                    if table.headers:
-                        table_parts.append(" | ".join(table.headers))
-                        table_parts.append("-" * 40)
-                    for row in table.data:
-                        table_parts.append(" | ".join(str(c) for c in row))
-                    table_parts.append("")
-                table_text = "\n".join(table_parts)
-
-            qwen_response = self._qwen.verify_page(
-                pdf_path, page_num, ocr_text, table_text
-            )
-
-            if qwen_response.has_corrections:
-                extraction, was_modified = apply_corrections(extraction, qwen_response)
-                if was_modified:
-                    extraction.verification_status = VerificationStatus.QWEN_CORRECTED
-                    score = self._scorer.score_page(pdf_path, page_num, extraction)
-                    logger.info(
-                        "Page %d [SCANNED] Qwen-VL applied %d corrections, "
-                        "%d missing text items, new coverage=%.1f%%",
-                        page_num + 1,
-                        len(qwen_response.corrections),
-                        len(qwen_response.missing_text),
-                        score * 100,
-                    )
-                else:
-                    extraction.verification_status = VerificationStatus.QWEN_VERIFIED
-            elif qwen_response.is_accurate:
-                extraction.verification_status = VerificationStatus.QWEN_VERIFIED
-                logger.info(
-                    "Page %d [SCANNED] Qwen-VL confirmed OCR accurate (confidence=%.1f%%)",
-                    page_num + 1, qwen_response.confidence * 100,
-                )
-            else:
-                extraction.verification_status = VerificationStatus.PENDING_HUMAN
-                logger.info(
-                    "Page %d [SCANNED] Qwen-VL inconclusive, marking for human review",
-                    page_num + 1,
-                )
-        elif confidence_gate.level == ConfidenceLevel.HIGH:
+        # Set verification status (Qwen-VL runs at Stage 3b in the pipeline)
+        if confidence_gate.level == ConfidenceLevel.HIGH:
             extraction.verification_status = VerificationStatus.AUTO_VERIFIED
         else:
             extraction.verification_status = VerificationStatus.NOT_VERIFIED
 
         contributions = {
-            "tesseract_ocr": confidence_gate.ocr_confidence,
+            "paddleocr": confidence_gate.ocr_confidence,
             "opencv": 0.0,
             "total": round(score, 4),
         }
@@ -406,7 +454,8 @@ class ScannedPathExecutor:
             status = "unresolved"
 
         logger.info(
-            "Page %d [SCANNED] final: OCR confidence=%.1f%% | coverage=%.1f%% [%s]%s",
+            "Page %d [SCANNED] final: PaddleOCR confidence=%.1f%% | "
+            "coverage=%.1f%% [%s]%s",
             page_num + 1,
             confidence_gate.ocr_confidence * 100,
             score * 100,
@@ -427,7 +476,7 @@ class ScannedPathExecutor:
             classification=classification,
         )
 
-    # ── Retry loop ────────────────────────────────────────────────────────────
+    # -- Retry loop -----------------------------------------------------------
 
     def _retry_loop(
         self,
@@ -441,12 +490,7 @@ class ScannedPathExecutor:
         params: ExtractionParameters,
         output_base: Path,
     ) -> Tuple[PageExtractionResult, ConfidenceGate, float, List[RunRecord]]:
-        """Retry OCR with progressively more aggressive preprocessing.
-
-        Each retry re-renders the page at a higher DPI and applies stronger
-        preprocessing (CLAHE, adaptive binarization, morphological cleanup),
-        then re-runs Tesseract to see if confidence improves.
-        """
+        """Retry OCR with progressively more aggressive preprocessing."""
         best_extraction = initial_extraction
         best_gate = initial_gate
         best_score = initial_score
@@ -473,11 +517,18 @@ class ScannedPathExecutor:
                 strategy.get("description", ""),
             )
 
+            # Free previous image buffers before re-rendering
+            img_bgr = gray = preprocessed = None
+            gc.collect()
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+
             # Re-render at higher DPI
             try:
-                img_bgr, _, _ = _render_page_image(
+                img_bgr, _, _ = render_page_image(
                     pdf_path, page_num, dpi=retry_dpi
                 )
+                img_h, img_w = img_bgr.shape[:2]
                 gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             except Exception as e:
                 logger.warning(
@@ -487,7 +538,7 @@ class ScannedPathExecutor:
 
             # Escalated preprocessing
             try:
-                preprocessed = _preprocess_for_retry(gray, strategy)
+                preprocessed = preprocess_for_retry(gray, strategy)
             except Exception as e:
                 logger.warning(
                     "Retry %d preprocessing failed p%d: %s",
@@ -495,31 +546,30 @@ class ScannedPathExecutor:
                 )
                 continue
 
-            # Re-run confidence scoring on the new preprocessed image
+            # Re-run PaddleOCR
             try:
-                retry_gate = _compute_page_confidence(
-                    pdf_path, page_num, preprocessed, self.config
-                )
+                retry_ocr = self._engine.ocr_image(preprocessed)
+                retry_gate = compute_confidence_gate(retry_ocr, self.config)
             except Exception as e:
                 logger.warning(
-                    "Retry %d confidence scoring failed p%d: %s",
-                    retry_num, page_num + 1, e,
+                    "Retry %d OCR failed p%d: %s", retry_num, page_num + 1, e
                 )
                 continue
 
-            # Re-run OCR extraction if confidence improved
+            # Build extraction if confidence improved
             retry_extraction = best_extraction
             retry_score = best_score
             if retry_gate.ocr_confidence > best_confidence:
                 try:
-                    rich_data = extract_rich_page_ocr(
-                        pdf_path, page_num, dpi=retry_dpi
-                    )
-                    retry_extraction = self._build_extraction_from_ocr(
-                        rich_data, page_num, pw, ph
+                    # Also run table detection on retry
+                    retry_tables = self._engine.detect_table_structure(img_bgr)
+                    retry_ocr.tables = retry_tables
+
+                    retry_extraction = build_extraction_from_paddle(
+                        retry_ocr, page_num, pw, ph, img_w, img_h
                     )
 
-                    # Re-run OpenCV tables
+                    # Merge OpenCV tables
                     try:
                         cv_result = self._cv.extract_page(
                             pdf_path, page_num, params
@@ -539,13 +589,12 @@ class ScannedPathExecutor:
                     )
                 except Exception as e:
                     logger.warning(
-                        "Retry %d re-extraction failed p%d: %s",
+                        "Retry %d extraction build failed p%d: %s",
                         retry_num, page_num + 1, e,
                     )
 
             delta = retry_gate.ocr_confidence - best_confidence
 
-            # Record the retry attempt
             run_records.append(RunRecord(
                 run_number=retry_num,
                 parameters={
@@ -570,14 +619,12 @@ class ScannedPathExecutor:
                 delta * 100,
             )
 
-            # Update best if improved
             if retry_gate.ocr_confidence > best_confidence:
                 best_confidence = retry_gate.ocr_confidence
                 best_gate = retry_gate
                 best_extraction = retry_extraction
                 best_score = retry_score
 
-            # Check if we've reached the threshold
             if best_confidence >= self._threshold:
                 logger.info(
                     "Page %d [SCANNED] passed at retry %d (confidence=%.1f%%)",
@@ -585,83 +632,118 @@ class ScannedPathExecutor:
                 )
                 break
 
-            # Early termination if plateau
             recent_deltas.append(abs(delta))
             if len(recent_deltas) >= 2:
                 if all(d < self._early_stop_delta for d in recent_deltas[-2:]):
                     logger.info(
-                        "Page %d [SCANNED] early stop at retry %d "
-                        "(no improvement)",
+                        "Page %d [SCANNED] early stop at retry %d (no improvement)",
                         page_num + 1, retry_num,
                     )
                     break
 
         return best_extraction, best_gate, best_score, run_records
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _build_extraction_from_ocr(
-        self,
-        rich_data: Dict[str, Any],
-        page_num: int,
-        page_width: float,
-        page_height: float,
-    ) -> PageExtractionResult:
-        """Build a PageExtractionResult from OCR rich data."""
-        text_blocks: List[TextBlock] = []
-
-        for block in rich_data.get("text_blocks", []):
-            for line in block.get("lines", []):
-                line_text_parts = []
-                line_bbox = None
-                for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    if text.strip():
-                        line_text_parts.append(text)
-                        bbox = span.get("bbox")
-                        if bbox and not line_bbox:
-                            line_bbox = BoundingBox(
-                                bbox[0], bbox[1], bbox[2], bbox[3]
-                            )
-                if line_text_parts and line_bbox:
-                    text_blocks.append(TextBlock(
-                        text=" ".join(line_text_parts),
-                        bbox=line_bbox,
-                        page_num=page_num,
-                        confidence=0.9,  # default, refined by confidence gate
-                        source="tesseract_ocr",
-                    ))
-
-        return PageExtractionResult(
-            page_num=page_num,
-            text_blocks=text_blocks,
-            tables=[],
-            images=[],
-            source="tesseract_ocr",
-            is_scanned=True,
-            page_width=page_width,
-            page_height=page_height,
-            page_type=PageType.SCANNED,
-        )
+    # -- Helpers --------------------------------------------------------------
 
     def _merge_opencv_tables(
         self,
         extraction: PageExtractionResult,
         cv_result: PageExtractionResult,
     ) -> PageExtractionResult:
-        """Merge OpenCV-detected tables into the OCR extraction result."""
+        """Merge OpenCV-detected tables into the extraction without duplicates."""
         if not cv_result.tables:
             return extraction
 
-        # Add OpenCV tables that don't overlap with existing ones
         for cv_table in cv_result.tables:
-            overlap = False
-            for existing in extraction.tables:
-                if existing.bbox.iou(cv_table.bbox) > 0.3:
-                    overlap = True
-                    break
+            overlap = any(
+                t.bbox.iou(cv_table.bbox) > 0.3 for t in extraction.tables
+            )
             if not overlap:
                 cv_table.source = "opencv"
                 extraction.tables.append(cv_table)
+
+        return extraction
+
+    def _run_qwen_vl_verification(
+        self,
+        pdf_path: str,
+        page_num: int,
+        extraction: PageExtractionResult,
+    ) -> PageExtractionResult:
+        """Run Qwen-VL verification on a flagged page.
+
+        If Qwen-VL is available and returns corrections, applies them
+        to the extraction and updates verification status.
+        """
+        try:
+            from ..qwen_vl_verifier import (
+                QwenVLVerifier,
+                apply_corrections,
+            )
+
+            verifier = QwenVLVerifier(self.config)
+
+            if not verifier.is_available():
+                logger.warning(
+                    "Page %d: Qwen-VL not available, skipping verification",
+                    page_num + 1,
+                )
+                return extraction
+
+            # Gather OCR text
+            ocr_text = extraction.all_text()
+
+            # Format table data if present
+            table_text = ""
+            if extraction.tables:
+                table_parts = []
+                for ti, table in enumerate(extraction.tables, 1):
+                    table_parts.append(f"Table {ti}:")
+                    if table.headers:
+                        table_parts.append(" | ".join(table.headers))
+                        table_parts.append("-" * 40)
+                    for row in table.data:
+                        table_parts.append(
+                            " | ".join(str(c) for c in row)
+                        )
+                    table_parts.append("")
+                table_text = "\n".join(table_parts)
+
+            response = verifier.verify_page(
+                pdf_path, page_num, ocr_text, table_text
+            )
+
+            if response.has_corrections:
+                extraction, was_modified = apply_corrections(
+                    extraction, response
+                )
+                if was_modified:
+                    extraction.verification_status = (
+                        VerificationStatus.QWEN_CORRECTED
+                    )
+                    logger.info(
+                        "Page %d: Qwen-VL applied %d corrections, "
+                        "%d missing text items",
+                        page_num + 1,
+                        len(response.corrections),
+                        len(response.missing_text),
+                    )
+            else:
+                if response.is_accurate:
+                    extraction.verification_status = (
+                        VerificationStatus.QWEN_VERIFIED
+                    )
+                    logger.info(
+                        "Page %d: Qwen-VL confirmed OCR is accurate "
+                        "(confidence=%.1f%%)",
+                        page_num + 1,
+                        response.confidence * 100,
+                    )
+
+        except Exception as e:
+            logger.warning(
+                "Page %d: Qwen-VL verification failed: %s",
+                page_num + 1, e,
+            )
 
         return extraction

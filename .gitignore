@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+.venv/
 .env
 
 # Pipeline output
@@ -12,6 +13,7 @@ Test Outputs/
 
 # Large/vendor folders (do not commit)
 EasyOCR/
+Edge-Case/*.pdf
 
 # PaddleOCR: commit code, ignore environments/artifacts
 PaddleOCR/.venv/

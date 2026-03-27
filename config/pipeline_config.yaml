@@ -64,13 +64,18 @@ page_classification:
   image_coverage_threshold: 0.4   # image area > 40% of page triggers hybrid/scanned
   min_image_size: 50              # ignore images smaller than 50px in either dimension
 
-# ─── Scanned Path Settings ──────────────────────────────────────────────────
+# ─── Scanned Path Settings (PaddleOCR) ──────────────────────────────────────
 scanned_path:
+  paddleocr:
+    use_gpu: true                 # GPU enabled (paddlepaddle-gpu 2.6.1 + CUDA 12 + cuDNN 8)
+    lang: "en"                    # PaddleOCR language code
+    use_angle_cls: true           # detect text rotation
+    show_log: false               # suppress PaddleOCR internal logs
+    det_model_dir: null           # custom detection model path (null = default)
+    rec_model_dir: null           # custom recognition model path (null = default)
+    table_model_dir: null         # custom table model path (null = default)
   ocr:
-    dpi: 300                      # render DPI for Tesseract
-    lang: "eng"                   # Tesseract language
-    psm: 6                        # page segmentation mode (6 = uniform block)
-    oem: 3                        # OCR engine mode (3 = default/LSTM)
+    dpi: 300                      # render DPI for PaddleOCR
   preprocessing:
     deskew: true
     denoise: true
@@ -82,13 +87,13 @@ scanned_path:
     high_threshold: 0.95          # above = HIGH confidence, no review needed
     medium_threshold: 0.85        # above = MEDIUM, Qwen-VL review
     low_threshold: 0.0            # below medium = LOW, Qwen-VL + human review
-    min_word_confidence: 60       # Tesseract word confidence below this = flagged
   qwen_vl:
     enabled: true
-    model: "qwen3-vl:8b"         # Ollama model name
+    model: "qwen3-vl:8b"          # Ollama model name
     ollama_host: "http://localhost:11434"
     gpu_num_ctx: -1               # -1 for GPU mode (auto)
     cpu_num_ctx: 0                # 0 for CPU mode
+    timeout: 300                  # per-page timeout in seconds (300s to allow cold-start)
   retry:
     max_retries: 3                # max OCR retry attempts per page
     early_termination_threshold: 0.01  # stop if confidence delta < 1% for 2 consecutive

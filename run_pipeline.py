@@ -20,6 +20,13 @@ Options
 """
 from __future__ import annotations
 
+import os
+# PaddlePaddle GPU memory: must be set BEFORE importing paddle.
+# auto_growth allocates on demand instead of pre-allocating a huge pool,
+# allowing empty_cache() to actually release memory between flushes.
+os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
+os.environ.setdefault("FLAGS_fraction_of_gpu_memory_to_use", "0.7")
+
 import argparse
 import logging
 import sys
@@ -35,8 +42,17 @@ def _configure_logging(level: str) -> None:
     )
 
 
-def _process_one(pdf_path: str, config_path: str) -> dict:
-    """Worker function – imports pipeline inside so it's safe to spawn."""
+def _process_one(pdf_path: str, config_path: str, log_level: str = "INFO") -> dict:
+    """Worker function -- runs in a subprocess so GPU memory is freed on exit."""
+    import logging as _logging
+    _logging.basicConfig(
+        level=getattr(_logging, log_level.upper(), _logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    _log = _logging.getLogger("worker")
+    _log.info("Starting PDF: %s", pdf_path)
+
     from src.pipeline import PDFPipeline
 
     pipeline = PDFPipeline(config_path)
@@ -105,23 +121,37 @@ def main(argv: list[str] | None = None) -> int:
     errors = []
 
     if args.workers == 1 or len(pdf_files) == 1:
-        # Sequential – simpler, better for debugging
         for pdf in pdf_files:
             try:
-                res = _process_one(str(pdf), config_path)
+                res = _process_one(str(pdf), config_path, args.log_level)
                 results.append(res)
                 logger.info(
-                    "✓ %s  score=%.1f%%  passed=%d/%d  unresolved=%d",
+                    "ok %s  score=%.1f%%  passed=%d/%d  unresolved=%d",
                     res["pdf"], res["overall_score"] * 100,
                     res["passed"], res["pages"], res["unresolved"],
                 )
             except Exception as exc:
-                logger.error("✗ %s  ERROR: %s", pdf, exc, exc_info=True)
+                logger.error("FAIL %s  ERROR: %s", pdf, exc, exc_info=True)
                 errors.append((str(pdf), str(exc)))
+            finally:
+                # Release PaddleOCR engine between PDFs to free GPU memory
+                try:
+                    from src.paddle_ocr_engine import PaddleOCREngine
+                    PaddleOCREngine.release_shared()
+                except Exception:
+                    pass
+                import gc
+                gc.collect()
+                try:
+                    import paddle
+                    if paddle.device.is_compiled_with_cuda():
+                        paddle.device.cuda.empty_cache()
+                except Exception:
+                    pass
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(_process_one, str(pdf), config_path): pdf
+                pool.submit(_process_one, str(pdf), config_path, args.log_level): pdf
                 for pdf in pdf_files
             }
             for future in as_completed(futures):
@@ -130,16 +160,16 @@ def main(argv: list[str] | None = None) -> int:
                     res = future.result()
                     results.append(res)
                     logger.info(
-                        "✓ %s  score=%.1f%%  passed=%d/%d  unresolved=%d",
+                        "ok %s  score=%.1f%%  passed=%d/%d  unresolved=%d",
                         res["pdf"], res["overall_score"] * 100,
                         res["passed"], res["pages"], res["unresolved"],
                     )
                 except Exception as exc:
-                    logger.error("✗ %s  ERROR: %s", pdf, exc, exc_info=True)
+                    logger.error("FAIL %s  ERROR: %s", pdf, exc, exc_info=True)
                     errors.append((str(pdf), str(exc)))
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n" + "═" * 60)
+    print("\n" + "=" * 60)
     print(f"  Processed : {len(results) + len(errors)} PDFs")
     print(f"  Succeeded : {len(results)}")
     print(f"  Failed    : {len(errors)}")
@@ -152,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n  Errors:")
         for path, msg in errors:
             print(f"    {path}: {msg}")
-    print("═" * 60)
+    print("=" * 60)
 
     return 0 if not errors else 1
 

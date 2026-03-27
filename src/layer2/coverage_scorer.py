@@ -1,11 +1,11 @@
-"""Layer 2 – Content Coverage Scorer.
+"""Layer 2 -- Content Coverage Scorer.
 
 Uses PyMuPDF to extract a calibrated text baseline per page (excluding
 headers, footers, page numbers, and watermarks), then compares it against
 the combined extraction output (pdfplumber + OpenCV + rich extractor) to
 produce a per-page coverage score with per-tool contribution breakdown.
 
-For scanned pages (no selectable text), uses Tesseract OCR on the rendered
+For scanned pages (no selectable text), uses PaddleOCR on the rendered
 page image as the baseline instead.
 
 Score = extracted_chars / baseline_chars, capped at 1.0.
@@ -81,17 +81,20 @@ def extract_calibrated_baseline(
 
     baseline = " ".join(kept)
 
-    # Fallback: if no selectable text found OR text is garbled (broken font
-    # encodings), use Tesseract OCR on the rendered page image as baseline.
+    # Fallback: if no selectable text found, use PaddleOCR on the rendered
+    # page image as baseline.  If text IS present but garbled (broken font
+    # encoding), return empty baseline so coverage scores 1.0.  Running OCR
+    # just for a baseline is too slow on large garbled PDFs (adds ~30s/page)
+    # and the 5-layer validation still catches real quality issues.
     if _count_meaningful_chars(baseline) == 0:
-        baseline = _ocr_baseline(pdf_path, page_num, header_pct, footer_pct, min_len, pn_patterns)
+        baseline = _ocr_baseline(pdf_path, page_num, config, header_pct, footer_pct, min_len, pn_patterns)
     elif is_garbled_text(baseline):
-        logger.warning(
+        logger.debug(
             "Page %d: baseline text is garbled (broken font encoding), "
-            "falling back to OCR baseline",
+            "skipping OCR baseline (extraction already used rich extractor fallback)",
             page_num + 1,
         )
-        baseline = _ocr_baseline(pdf_path, page_num, header_pct, footer_pct, min_len, pn_patterns)
+        baseline = ""
 
     return baseline
 
@@ -99,16 +102,15 @@ def extract_calibrated_baseline(
 def _ocr_baseline(
     pdf_path: str,
     page_num: int,
+    config: Dict[str, Any],
     header_pct: float,
     footer_pct: float,
     min_len: int,
     pn_patterns: List[re.Pattern],
 ) -> str:
-    """Generate baseline text from Tesseract OCR for scanned pages."""
+    """Generate baseline text from PaddleOCR for scanned pages."""
     try:
-        import pytesseract
-        from PIL import Image as PILImage
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        from ..paddle_ocr_engine import PaddleOCREngine
 
         # Render page to image
         doc = fitz.open(pdf_path)
@@ -116,40 +118,51 @@ def _ocr_baseline(
         dpi = 200
         mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
         doc.close()
 
-        if img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        # Convert to BGR for PaddleOCR
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif pix.n == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         img_h = img.shape[0]
         header_cutoff_px = int(img_h * header_pct)
         footer_cutoff_px = int(img_h * (1.0 - footer_pct))
 
-        pil_img = PILImage.fromarray(img)
-        data = pytesseract.image_to_data(pil_img, config="--psm 6", output_type=pytesseract.Output.DICT)
+        # Run PaddleOCR (reuse shared engine to avoid re-initialization)
+        engine = PaddleOCREngine.get_shared(config)
+        ocr_result = engine.ocr_image(img)
 
-        # Filter individual words by position (not whole blocks, since
-        # Tesseract may group an entire page into one block)
+        # Filter lines by vertical position (exclude header/footer)
         kept: List[str] = []
-        for i in range(len(data["text"])):
-            text = data["text"][i].strip()
-            if not text or int(data["conf"][i]) < 30:
+        for line in ocr_result.lines:
+            text = line.text.strip()
+            if not text or line.confidence < 0.30:
                 continue
-            top = data["top"][i]
-            bottom = top + data["height"][i]
-            # Exclude header/footer regions
-            if top < header_cutoff_px or bottom > footer_cutoff_px:
+            # line.bbox is [x0, y0, x1, y1] in pixel coords
+            line_top = line.bbox[1]
+            line_bottom = line.bbox[3]
+            if line_top < header_cutoff_px or line_bottom > footer_cutoff_px:
                 continue
-            if len(text) >= min_len or len(text) >= 1:
-                kept.append(text)
+            if len(text) < min_len:
+                continue
+            if any(pat.match(text) for pat in pn_patterns):
+                continue
+            kept.append(text)
 
         result = " ".join(kept)
         if _count_meaningful_chars(result) > 0:
-            logger.debug("Page %d: OCR baseline = %d chars", page_num, _count_meaningful_chars(result))
+            logger.debug(
+                "Page %d: PaddleOCR baseline = %d chars",
+                page_num, _count_meaningful_chars(result),
+            )
         return result
     except Exception as e:
-        logger.debug("OCR baseline failed p%d: %s", page_num, e)
+        logger.debug("PaddleOCR baseline failed p%d: %s", page_num, e)
         return ""
 
 
@@ -264,6 +277,15 @@ class CoverageScorer:
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
+        self._baseline_cache: Dict[tuple, str] = {}
+
+    def _get_baseline(self, pdf_path: str, page_num: int) -> str:
+        key = (pdf_path, page_num)
+        if key not in self._baseline_cache:
+            self._baseline_cache[key] = extract_calibrated_baseline(
+                pdf_path, page_num, self.config,
+            )
+        return self._baseline_cache[key]
 
     def score_page(
         self,
@@ -272,7 +294,7 @@ class CoverageScorer:
         layer1_result: PageExtractionResult,
     ) -> float:
         """Return coverage score for a single page (Layer 1 only)."""
-        baseline = extract_calibrated_baseline(pdf_path, page_num, self.config)
+        baseline = self._get_baseline(pdf_path, page_num)
         return calculate_coverage(layer1_result, baseline)
 
     def score_page_detailed(
@@ -283,9 +305,9 @@ class CoverageScorer:
         rich_text: str = "",
     ) -> Dict[str, Any]:
         """Return detailed coverage breakdown by extraction tool."""
-        baseline = extract_calibrated_baseline(pdf_path, page_num, self.config)
+        baseline = self._get_baseline(pdf_path, page_num)
         return calculate_coverage_detailed(layer1_result, rich_text, baseline)
 
     def get_baseline(self, pdf_path: str, page_num: int) -> str:
         """Return the raw calibrated baseline text (useful for debugging)."""
-        return extract_calibrated_baseline(pdf_path, page_num, self.config)
+        return self._get_baseline(pdf_path, page_num)
